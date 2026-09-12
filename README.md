@@ -4,7 +4,12 @@
 
 ## 当前进度
 
-阶段 0：已准备学习路线与第一道练习。阶段 1～5 尚未实现；当前没有可运行的线程池。
+阶段 0 已完成。当前完成第一个代码里程碑：`ThreadPool.cpp` 创建 4 个线程，保存到 `vector<thread>`，析构时通过 `joinable()` 和 `join()` 回收。
+这是线程池骨架，尚无任务队列、等待循环和停止协议。下一步学习任务队列、mutex 与 condition_variable。
+
+代码来自「制定线程池项目」中学习者给出的首个可提交版本，保留原有实现与临时对象 `ThreadPool(4)`，只整理排版和聊天转义。
+已用 C++11 编译并运行，退出码为 0，输出包含编号 0～3，顺序不固定。编译保留一处 `int` 与 `works.size()` 比较的符号警告，后续学习时再调整。
+当前只验证正常创建 4 个线程的教学场景；部分线程创建失败时的回收仍待后续补全。
 先由学习者写代码，再一起检查、验证、提交；不提前填完后续答案。
 
 起点依据：你在另一个仓库 cpp-learing 中的 StudentManagement2.0 已使用类、构造函数、vector、引用和文件读写。
@@ -18,22 +23,24 @@
 停止时拒绝新任务，执行完已接收任务，唤醒并 join 所有工作线程。
 第一版不加入 future、packaged_task、可变参数模板、动态扩缩容或无锁队列。
 
-## 阶段与验收
+## 原定路线与验收
+
+实际学习已完成 thread/join 基础，并提前实现阶段 4 中的创建与回收骨架；不代表阶段 2～5 全部完成。
 
 | 阶段 | 你要动手完成的内容 | 要掌握的知识 | 验收后提交信息 |
 | --- | --- | --- | --- |
-| 0（当前） | 阅读路线，开始下面的练习 | 线程池的目标和学习顺序 | docs(thread-pool): initialize learning roadmap |
+| 0（已完成） | 阅读路线，开始下面的练习 | 线程池的目标和学习顺序 | docs(thread-pool): initialize learning roadmap |
 | 1 | 一个普通函数在子线程执行，主线程等待 | thread、函数作为入口、join、生命周期 | feat(thread-pool): complete thread and join exercise |
 | 2 | 单线程任务队列；再练习两个线程安全更新计数 | queue、std::function<void()>、lambda、mutex、lock_guard | feat(thread-pool): complete queue and mutex exercises |
 | 3 | 一个 worker 等待、取出并执行任务，可结束退出 | unique_lock、condition_variable、带条件的 wait、notify_one | feat(thread-pool): complete single worker loop |
-| 4 | 封装 ThreadPool，构造时启动固定数量 worker | vector<thread>、构造与析构、共享状态、禁止复制 | feat(thread-pool): complete fixed size thread pool |
+| 4 | 封装 ThreadPool，构造时启动固定数量 worker | `vector<thread>`、构造与析构、共享状态、禁止复制 | feat(thread-pool): complete fixed size thread pool |
 | 5 | 完成停止边界和验证 | 停止标志、notify_all、排空任务、join、资源释放 | feat(thread-pool): complete graceful shutdown |
 
 每阶段流程：你写代码 → 解释关键语句 → 一起检查并运行验收 → 更新这里的真实进度 → commit 并同步 GitHub。
 未完成的练习不标记完成；阶段较大时可以保存明确注明 WIP 的进度，但不算验收完成。
 之后是否学习返回值和泛化，由实际掌握情况决定。
 
-## 第一课：创建并等待一个线程
+## 基础复习：创建并等待一个线程
 
 在本目录新建 stage01_thread.cpp，自己完成以下要求：
 
@@ -51,12 +58,12 @@
 - join 等待的是谁？为什么 done 一定在最后？
 - 如果线程对象销毁时仍可 join，会有什么问题？
 
-## 编译方式（写完练习后使用）
+## 当前版本编译方式
 
 ### Windows / Visual Studio
 
 之前的学生管理项目使用 Visual Studio 工程，可继续用熟悉的环境。
-新建独立的 C++ 控制台项目，加入 stage01_thread.cpp，确保项目中只有一个 main。
+新建独立的 C++ 控制台项目，加入 ThreadPool.cpp，确保项目中只有一个 main。
 使用支持 C++11 及以上的编译器；现代 MSVC 的默认 C++14 模式即可。用 Ctrl+F5 运行。
 
 ### macOS / Linux
@@ -64,11 +71,11 @@
 在本目录执行：
 
 ```sh
-c++ -std=c++11 -Wall -Wextra -pedantic -pthread stage01_thread.cpp -o /tmp/thread_pool_stage01
+c++ -std=c++11 -Wall -Wextra -pedantic -pthread ThreadPool.cpp -o /tmp/thread_pool_stage01
 /tmp/thread_pool_stage01
 ```
 
-当前仅提交文档，以上编译步骤需要先完成练习，没有声称已经编译通过。
+运行时会输出 4 个线程编号；输出顺序不保证，文字也可能交错。临时对象在语句结束时析构并等待线程完成。
 
 ## 后续阶段的正确性要求
 
