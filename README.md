@@ -4,16 +4,25 @@
 
 ## 当前进度
 
-阶段 0 已完成。当前完成第一个代码里程碑：`ThreadPool.cpp` 创建 4 个线程，保存到 `vector<thread>`，析构时通过 `joinable()` 和 `join()` 回收。
-这是线程池骨架，尚无任务队列、等待循环和停止协议。下一步学习任务队列、mutex 与 condition_variable。
+当前完成第四个代码里程碑：多文件项目结构、VS Code 构建/调试配置与可判断结果的测试入口。
 
-代码来自「制定线程池项目」中学习者给出的首个可提交版本，保留原有实现与临时对象 `ThreadPool(4)`，只整理排版和聊天转义。
-已用 C++11 编译并运行，退出码为 0，输出包含编号 0～3，顺序不固定。编译保留一处 `int` 与 `works.size()` 比较的符号警告，后续学习时再调整。
-当前只验证正常创建 4 个线程的教学场景；部分线程创建失败时的回收仍待后续补全。
+- `ThreadPool.h`：类声明和成员，使用 pragma once 防止重复包含。
+- `ThreadPool.cpp`：成员函数实现，保留第三版核心行为；析构循环索引改为 std::size_t，消除符号比较警告。
+- `main.cpp`：5 个独立测试，每组输出 PASS/FAIL；失败返回非零退出码。
+- `.vscode/tasks.json`：默认任务同时编译 main.cpp 和 ThreadPool.cpp；run 依赖 build。
+- `.vscode/launch.json`：启动前执行完整构建，调试生成的 main。
+- `.gitignore`：忽略可执行文件、目标文件和 macOS 调试产物。
+
+验证（2026-09-13）：C++17 多文件编译通过，开启 Wall/Wextra/Werror/pedantic 无警告；5/5 测试通过。
+测试分别覆盖空池析构、0 和 -3 拒绝重复提交、1 和 3 个 worker 将 20 个任务各执行一次。每个池离开作用域后才核对结果，主线程不通过 sleep 猜测完成时间。此测试覆盖多 worker 下的正确性，不测吞吐量或证明并行加速。
+
+目前没有独立 Stop 接口，调用方须在析构开始前停止并等待所有提交线程；任务不得销毁自身线程池。未处理空任务、任务异常、部分线程创建失败；这些已知边界不属于本次文件拆分成果。
+下一步按学习进度完善基础边界，再逐步引入返回值与 future。
+
 先由学习者写代码，再一起检查、验证、提交；不提前填完后续答案。
 
 起点依据：你在另一个仓库 cpp-learing 中的 StudentManagement2.0 已使用类、构造函数、vector、引用和文件读写。
-这些代码不能证明多线程掌握程度，因此暂从 thread 和 join 开始；如已掌握，可用练习结果跳过预备阶段。
+项目最初以 thread 和 join 为起点，目前已推进到线程数量校验、提交状态检查和析构排空。
 
 ## 第一版的边界
 
@@ -25,7 +34,7 @@
 
 ## 原定路线与验收
 
-实际学习已完成 thread/join 基础，并提前实现阶段 4 中的创建与回收骨架；不代表阶段 2～5 全部完成。
+实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的任务异常及线程创建失败处理仍未完成。下表保留最初学习路线，实际进度以上述里程碑为准。
 
 | 阶段 | 你要动手完成的内容 | 要掌握的知识 | 验收后提交信息 |
 | --- | --- | --- | --- |
@@ -58,24 +67,22 @@
 - join 等待的是谁？为什么 done 一定在最后？
 - 如果线程对象销毁时仍可 join，会有什么问题？
 
-## 当前版本编译方式
+## 当前版本编译与运行
 
-### Windows / Visual Studio
+VS Code 请直接打开 cpp-thread-pool 文件夹。Cmd+Shift+B 运行默认的 build thread pool；命令面板选择 Tasks: Run Task → run thread pool 会先构建再运行。F5 选择“运行线程池”会先构建再调试。不要选择“生成活动文件”任务来构建本多文件项目。
 
-之前的学生管理项目使用 Visual Studio 工程，可继续用熟悉的环境。
-新建独立的 C++ 控制台项目，加入 ThreadPool.cpp，确保项目中只有一个 main。
-使用支持 C++11 及以上的编译器；现代 MSVC 的默认 C++14 模式即可。用 Ctrl+F5 运行。
+当前 VS Code 配置针对 macOS，使用 /usr/bin/clang++、LLDB 和 Microsoft C/C++ 扩展；其他系统需按安装位置调整工具链。
 
-### macOS / Linux
-
-在本目录执行：
+macOS / Linux 也可以在仓库根目录执行：
 
 ```sh
-c++ -std=c++11 -Wall -Wextra -pedantic -pthread ThreadPool.cpp -o /tmp/thread_pool_stage01
-/tmp/thread_pool_stage01
+c++ -std=c++17 -Wall -Wextra -pedantic -pthread main.cpp ThreadPool.cpp -o main
+./main
 ```
 
-运行时会输出 4 个线程编号；输出顺序不保证，文字也可能交错。临时对象在语句结束时析构并等待线程完成。
+Windows 可将两个 cpp 和头文件加入同一个 Visual Studio C++ 控制台项目，使用 C++17。main.cpp 是唯一入口，不要只编译它。
+
+成功时最后输出“测试结束：5/5 通过”，退出码为 0；worker 的创建日志允许交错。
 
 ## 后续阶段的正确性要求
 
