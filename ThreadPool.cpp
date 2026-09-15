@@ -1,5 +1,6 @@
 #include "ThreadPool.h"
 #include<iostream>
+#include <stdexcept>
 
 
 bool NumberJudgment(int threadpoolCount){
@@ -52,6 +53,25 @@ for(int i=0;i<threadpoolCount;++i){
     }
 }
 
+std::future<int> ThreadPool::SubmitInt(const std::function<int()>&task){
+    std::packaged_task<int()>Task(task);
+   std::future<int> result=Task.get_future();
+   std::unique_lock<std::mutex> lock(mtx);
+   if(running){
+    auto taskptr=std::make_shared<std::packaged_task<int()>>(std::move(Task));
+    auto wrapperTask=[taskptr](){
+        (*taskptr)();
+    };
+    tasks.push(wrapperTask);
+    lock.unlock();
+    condition.notify_one();
+    return result;
+   }
+   else{
+    throw std::runtime_error("ThreadPool has stopped");
+   }
+}
+
 ThreadPool::~ThreadPool(){
      {
         std::unique_lock<std::mutex> lock(mtx);
@@ -59,6 +79,8 @@ ThreadPool::~ThreadPool(){
      }
     condition.notify_all();
     for(std::size_t i=0;i<workers.size();++i){
-    workers[i].join();
+        if(workers[i].joinable()){
+        workers[i].join();
+        }
 }
 }

@@ -1,7 +1,13 @@
 #include "ThreadPool.h"
 #include <iostream>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
+
 
 // 每个测试返回 bool：失败时 main 返回 1，方便构建工具判断结果。
 bool TestEmptyPool() {
@@ -64,6 +70,114 @@ bool TestTaskCompletion(int threadCount) {
     return passed;
 }
 
+
+bool Report(bool passed, const char* name) {
+    std::cout << (passed ? "[PASS] " : "[FAIL] ") << name << '\n';
+    return passed;
+}
+
+bool TestIntResult() {
+    ThreadPool pool(2);
+    auto result = pool.SubmitInt([] { return 42; });
+    return Report(result.get() == 42, "SubmitInt 返回 42");
+}
+
+bool TestMultipleIntResults() {
+    ThreadPool pool(4);
+    std::vector<std::future<int>> results;
+    for (int i = 0; i < 100; ++i) {
+        results.push_back(pool.SubmitInt([i] { return i * i - 7; }));
+    }
+    bool passed = true;
+    for (int i = 0; i < 100; ++i) {
+        if (results[i].get() != i * i - 7) passed = false;
+    }
+    return Report(passed, "100 个 int 任务全部返回正确结果");
+}
+
+bool TestMixedSubmissions() {
+    std::atomic<int> voidCount{0};
+    std::vector<std::future<int>> results;
+    bool passed = true;
+    {
+        ThreadPool pool(3);
+        for (int i = 0; i < 50; ++i) {
+            if (!pool.Submit([&voidCount] { ++voidCount; })) passed = false;
+            results.push_back(pool.SubmitInt([i] { return i + 10; }));
+        }
+    }
+    for (int i = 0; i < 50; ++i) {
+        if (results[i].get() != i + 10) passed = false;
+    }
+    return Report(passed && voidCount == 50, "50 个 void 与 50 个 int 混合执行");
+}
+
+bool TestPendingIntShutdown() {
+    std::promise<void> started;
+    std::promise<void> release;
+    auto gate = release.get_future().share();
+    auto pool = std::make_unique<ThreadPool>(1);
+    auto active = pool->SubmitInt([&started, gate] {
+        started.set_value();
+        gate.wait();
+        return 123;
+    });
+    started.get_future().wait();
+    // 唯一 worker 被 gate 阻塞，后面的任务必定还在队列中。
+    auto queued = pool->SubmitInt([] { return 456; });
+    bool pending = active.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout
+        && queued.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
+    std::promise<void> destroying;
+    auto destructionStarted = destroying.get_future();
+    auto shutdown = std::async(std::launch::async,
+        [owned = std::move(pool), &destroying]() mutable {
+            destroying.set_value();
+            owned.reset();
+        });
+    destructionStarted.wait();
+    bool waited = shutdown.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
+    release.set_value();
+    shutdown.get();
+    bool ready = active.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready
+        && queued.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+    int activeValue = active.get();
+    int queuedValue = queued.get();
+    return Report(pending && waited && ready && activeValue == 123 && queuedValue == 456,
+                  "析构等待执行中任务、排空队列，析构后 future 可取");
+}
+
+bool TestStoppedIntSubmission() {
+    bool passed = true;
+    bool executed = false;
+    for (int count : {0, -3}) {
+        ThreadPool pool(count);
+        for (int i = 0; i < 2; ++i) {
+            try {
+                pool.SubmitInt([&executed] { executed = true; return 1; });
+                passed = false;
+            } catch (const std::runtime_error&) {
+                // 再次提交也能抛异常，验证异常退出会释放锁。
+            } catch (...) {
+                passed = false;
+            }
+        }
+    }
+    return Report(passed && !executed, "停止池重复 SubmitInt 抛出 runtime_error");
+}
+
+bool TestIntTaskException() {
+    ThreadPool pool(1);
+    auto failed = pool.SubmitInt([]() -> int { throw std::runtime_error("task failed"); });
+    auto next = pool.SubmitInt([] { return 99; });
+    bool caught = false;
+    try {
+        failed.get();
+    } catch (const std::runtime_error&) {
+        caught = true;
+    }
+    return Report(caught && next.get() == 99, "int 任务异常由 future 传递，worker 继续执行");
+}
+
 int main() {
     int failures = 0;
     if (!TestEmptyPool()) ++failures;
@@ -72,6 +186,13 @@ int main() {
     if (!TestTaskCompletion(1)) ++failures;
     if (!TestTaskCompletion(3)) ++failures;
 
-    std::cout << "测试结束：" << (5 - failures) << "/5 通过\n";
+    if (!TestIntResult()) ++failures;
+    if (!TestMultipleIntResults()) ++failures;
+    if (!TestMixedSubmissions()) ++failures;
+    if (!TestPendingIntShutdown()) ++failures;
+    if (!TestStoppedIntSubmission()) ++failures;
+    if (!TestIntTaskException()) ++failures;
+
+    std::cout << "测试结束：" << (11 - failures) << "/11 通过\n";
     return failures == 0 ? 0 : 1;
 }

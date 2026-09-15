@@ -5,6 +5,7 @@
 #include<condition_variable>
 #include<functional>
 #include<queue>
+#include<future>
 
 
 class ThreadPool{
@@ -12,6 +13,7 @@ public:
 ThreadPool(int threadpoolCount);
 
 bool Submit(const std::function<void()>& task);
+std::future<int> SubmitInt(const std::function<int()>& task);
 
 ~ThreadPool();
 
