@@ -7,6 +7,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+#include <string>
+#include <type_traits>
 
 
 // 每个测试返回 bool：失败时 main 返回 1，方便构建工具判断结果。
@@ -178,6 +180,78 @@ bool TestIntTaskException() {
     return Report(caught && next.get() == 99, "int 任务异常由 future 传递，worker 继续执行");
 }
 
+bool TestTemplateResults() {
+    ThreadPool pool(3);
+    auto integer = pool.SubmitNew([] { return 42; });
+    auto decimal = pool.SubmitNew([] { return 3.25; });
+    auto text = pool.SubmitNew([] { return std::string("thread pool"); });
+    static_assert(std::is_same_v<decltype(integer), std::future<int>>);
+    static_assert(std::is_same_v<decltype(decimal), std::future<double>>);
+    static_assert(std::is_same_v<decltype(text), std::future<std::string>>);
+    const bool intOk = integer.get() == 42;
+    const bool doubleOk = decimal.get() == 3.25;
+    const bool stringOk = text.get() == "thread pool";
+    return Report(intOk && doubleOk && stringOk,
+                  "SubmitNew 正确返回 int、double、string 及对应 future 类型");
+}
+
+bool TestTemplateMixedSubmissions() {
+    std::atomic<int> voidCount{0};
+    std::vector<std::future<int>> results;
+    bool passed = true;
+    {
+        ThreadPool pool(3);
+        for (int i = 0; i < 50; ++i) {
+            if (!pool.Submit([&voidCount] { ++voidCount; })) passed = false;
+            results.push_back(pool.SubmitNew([i] { return i * 2; }));
+        }
+        // 析构排空队列后，再读取任务结果。
+    }
+    for (int i = 0; i < 50; ++i) {
+        if (results[i].get() != i * 2) passed = false;
+    }
+    return Report(passed && voidCount == 50,
+                  "Submit 与 SubmitNew 混合执行，析构后 future 可取");
+}
+
+bool TestStoppedTemplateSubmission() {
+    bool passed = true;
+    bool executed = false;
+    for (int count : {0, -3}) {
+        // 没有公开 Stop 接口，用无效线程数构造仍存活的停止池。
+        ThreadPool pool(count);
+        for (int i = 0; i < 2; ++i) {
+            try {
+                pool.SubmitNew([&executed] { executed = true; return 1; });
+                passed = false;
+            } catch (const std::runtime_error& error) {
+                if (std::string(error.what()) != "ThreadPool has stopped") passed = false;
+            } catch (...) {
+                passed = false;
+            }
+        }
+    }
+    return Report(passed && !executed,
+                  "停止池重复 SubmitNew 抛异常且不执行任务");
+}
+
+bool TestTemplateTaskException() {
+    ThreadPool pool(1);
+    auto failed = pool.SubmitNew([]() -> std::string {
+        throw std::runtime_error("template task failed");
+    });
+    auto next = pool.SubmitNew([] { return 99; });
+    bool caught = false;
+    try {
+        failed.get();
+    } catch (const std::runtime_error& error) {
+        caught = std::string(error.what()) == "template task failed";
+    }
+    const bool continued = next.get() == 99;
+    return Report(caught && continued,
+                  "SubmitNew 异常由 future 传递，worker 继续执行");
+}
+
 int main() {
     int failures = 0;
     if (!TestEmptyPool()) ++failures;
@@ -193,6 +267,11 @@ int main() {
     if (!TestStoppedIntSubmission()) ++failures;
     if (!TestIntTaskException()) ++failures;
 
-    std::cout << "测试结束：" << (11 - failures) << "/11 通过\n";
+    if (!TestTemplateResults()) ++failures;
+    if (!TestTemplateMixedSubmissions()) ++failures;
+    if (!TestStoppedTemplateSubmission()) ++failures;
+    if (!TestTemplateTaskException()) ++failures;
+
+    std::cout << "测试结束：" << (15 - failures) << "/15 通过\n";
     return failures == 0 ? 0 : 1;
 }
