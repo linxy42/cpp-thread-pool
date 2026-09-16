@@ -252,6 +252,128 @@ bool TestTemplateTaskException() {
                   "SubmitNew 异常由 future 传递，worker 继续执行");
 }
 
+
+int add(int a, int b) { return a + b; }
+
+bool TestParameterizedFunction() {
+    ThreadPool pool(2);
+    auto result = pool.SubmitNew(add, 10, 20);
+    static_assert(std::is_same_v<decltype(result), std::future<int>>);
+    return Report(result.get() == 30, "普通函数 add 接收两个参数");
+}
+
+bool TestParameterizedLambda() {
+    ThreadPool pool(2);
+    auto result = pool.SubmitNew([](int a, double b, int c) {
+        return a * b + c;
+    }, 4, 2.5, 3);
+    static_assert(std::is_same_v<decltype(result), std::future<double>>);
+    return Report(result.get() == 13.0, "lambda 接收多个不同类型参数");
+}
+
+bool TestParameterizedStrings() {
+    ThreadPool pool(2);
+    std::string prefix = "hello";
+    auto result = pool.SubmitNew([](std::string a, std::string b) {
+        return a + " " + b;
+    }, prefix, std::string("pool"));
+    static_assert(std::is_same_v<decltype(result), std::future<std::string>>);
+    const auto value = result.get();
+    return Report(value == "hello pool" && prefix == "hello",
+                  "string 返回值，左值与右值参数");
+}
+
+bool TestBoundReference() {
+    int value = 10;
+    ThreadPool pool(1);
+    auto increment = [](int& n) { return ++n; };
+    auto copied = pool.SubmitNew(increment, value);
+    const bool copyOk = copied.get() == 11 && value == 10;
+    auto referenced = pool.SubmitNew(increment, std::ref(value));
+    const bool refOk = referenced.get() == 11 && value == 11;
+    return Report(copyOk && refOk, "bind 默认拷贝左值，std::ref 修改原值");
+}
+
+struct LvalueCallable {
+    std::shared_ptr<int> copies = std::make_shared<int>(0);
+    LvalueCallable() = default;
+    LvalueCallable(const LvalueCallable& other) : copies(other.copies) { ++*copies; }
+    LvalueCallable(LvalueCallable&&) = default;
+    int operator()(int n) { return n + 1; }
+};
+
+bool TestMoveOnlyBinding() {
+    ThreadPool pool(1);
+    auto callable = [owned = std::make_unique<int>(40)](int n) {
+        return *owned + n;
+    };
+    LvalueCallable lvalueCallable;
+    auto lvalue = pool.SubmitNew(lvalueCallable, 8);
+    auto result = pool.SubmitNew(std::move(callable), 2);
+    auto argument = pool.SubmitNew([](const std::unique_ptr<int>& n) {
+        return *n;
+    }, std::make_unique<int>(7));
+    const bool callableOk = result.get() == 42;
+    const bool argumentOk = argument.get() == 7;
+    return Report(callableOk && argumentOk && lvalue.get() == 9 && *lvalueCallable.copies == 1,
+                  "左值 callable、仅可移动 callable 与绑定参数");
+}
+
+bool TestParameterizedMixed() {
+    std::atomic<int> count{0};
+    std::vector<std::future<int>> results;
+    std::future<void> voidResult;
+    bool accepted = true;
+    {
+        ThreadPool pool(3);
+        for (int i = 0; i < 50; ++i) {
+            if (!pool.Submit([&count] { ++count; })) accepted = false;
+            results.push_back(pool.SubmitNew(add, i, 10));
+        }
+        voidResult = pool.SubmitNew([](std::atomic<int>& n, int amount) {
+            n.fetch_add(amount);
+        }, std::ref(count), 5);
+    }
+    voidResult.get();
+    for (int i = 0; i < 50; ++i) {
+        if (results[i].get() != i + 10) accepted = false;
+    }
+    return Report(accepted && count == 55,
+                  "带参数任务与 Submit 混合执行，含 future<void> 和析构排空");
+}
+
+bool TestStoppedParameterized() {
+    bool passed = true;
+    bool executed = false;
+    for (int count : {0, -3}) {
+        ThreadPool pool(count);
+        for (int i = 0; i < 2; ++i) {
+            try {
+                pool.SubmitNew([&executed](int n) { executed = true; return n; }, i);
+                passed = false;
+            } catch (const std::runtime_error& error) {
+                if (std::string(error.what()) != "ThreadPool has stopped") passed = false;
+            } catch (...) { passed = false; }
+        }
+    }
+    return Report(passed && !executed, "停止状态重复提交带参数任务抛异常");
+}
+
+bool TestParameterizedException() {
+    ThreadPool pool(1);
+    auto failed = pool.SubmitNew([](std::string message) -> int {
+        throw std::runtime_error(message);
+    }, std::string("parameterized failure"));
+    auto next = pool.SubmitNew(add, 2, 3);
+    bool caught = false;
+    try { failed.get(); }
+    catch (const std::runtime_error& error) {
+        caught = std::string(error.what()) == "parameterized failure";
+    }
+    const bool continued = next.get() == 5;
+    return Report(caught && continued, "带参数任务异常经 future 传递，worker 继续执行");
+}
+
 int main() {
     int failures = 0;
     if (!TestEmptyPool()) ++failures;
@@ -272,6 +394,15 @@ int main() {
     if (!TestStoppedTemplateSubmission()) ++failures;
     if (!TestTemplateTaskException()) ++failures;
 
-    std::cout << "测试结束：" << (15 - failures) << "/15 通过\n";
+    if (!TestParameterizedFunction()) ++failures;
+    if (!TestParameterizedLambda()) ++failures;
+    if (!TestParameterizedStrings()) ++failures;
+    if (!TestParameterizedMixed()) ++failures;
+    if (!TestParameterizedException()) ++failures;
+    if (!TestBoundReference()) ++failures;
+    if (!TestMoveOnlyBinding()) ++failures;
+    if (!TestStoppedParameterized()) ++failures;
+
+    std::cout << "测试结束：" << (23 - failures) << "/23 通过\n";
     return failures == 0 ? 0 : 1;
 }

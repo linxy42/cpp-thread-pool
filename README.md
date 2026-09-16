@@ -4,7 +4,7 @@
 
 ## 当前进度
 
-当前已在多文件结构、SubmitInt 与 future<int> 的基础上，完成第六阶段：模板版 `SubmitNew(F task)`，支持 `int`、`double`、`std::string` 等不同返回类型。当前项目使用 **C++17**。
+当前已在模板返回值的基础上，完成第七阶段：可变参数模板 `SubmitNew(F&& task, Arges&&... arges)`，支持带参数任务、不同返回类型和参数列表。当前项目使用 **C++17**。
 
 已实现能力：
 
@@ -12,13 +12,13 @@
 - 使用 `std::mutex` 保护任务队列和运行状态，配合 `std::condition_variable` 等待与唤醒；worker 取出任务后释放锁，再执行任务。
 - 析构时设置停止状态，唤醒所有 worker，执行完已接收的任务，再逐一 `join()`，实现优雅停止。
 - `Submit` 支持无参数的 `void` 任务：接受任务返回 `true`，线程池不运行时返回 `false`。
-- `SubmitNew` 自动推导返回类型，返回对应的 `std::future`；线程池不运行时抛出 `std::runtime_error`。原有 `SubmitInt` 接口仍保留。
+- `SubmitNew` 使用可变参数模板、`std::bind` 和 `std::forward` 接收任务及参数，自动推导返回类型，返回对应的 `std::future`；线程池不运行时抛出 `std::runtime_error`。原有 `SubmitInt` 接口仍保留。
 
 项目结构：
 
 - `ThreadPool.h`：类声明、成员和模板版 `SubmitNew` 的完整定义，使用 pragma once 防止重复包含；模板定义放在头文件中，供调用处实例化。
 - `ThreadPool.cpp`：构造函数、worker 循环、`Submit`、`SubmitInt` 和析构函数的实现。
-- `main.cpp`：15 个独立测试，每组输出 PASS/FAIL；失败返回非零退出码。
+- `main.cpp`：23 个独立测试，每组输出 PASS/FAIL；失败返回非零退出码。
 - `.vscode/tasks.json`：默认任务同时编译 main.cpp 和 ThreadPool.cpp；run 依赖 build。
 - `.vscode/launch.json`：启动前执行完整构建，调试生成的 main。
 - `.gitignore`：忽略可执行文件、目标文件和 macOS 调试产物。
@@ -31,12 +31,14 @@ SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测
 
 模板阶段验证（2026-09-16）：C++17 严格编译无警告，15/15 测试通过。在原有 11 项基础上，新增不同返回值与对应 future 类型检查、Submit/SubmitNew 混合提交及析构排空、停止池重复提交异常、任务异常经 future 传递后 worker 继续执行。
 
-下一步按学习进度完善空任务、普通 Submit 任务异常和部分线程创建失败时的回收；独立 Stop 接口、可变参数模板和动态扩缩容尚未实现。
+带参数阶段验证（2026-09-16）：C++17 严格编译无警告，23/23 测试通过。新增普通函数 add、多参数 lambda、string 返回值和左值/右值参数、std::ref、左值 callable 与仅可移动对象、带参数任务与 Submit 混合执行及析构排空、停止状态重复提交异常、任务异常传递测试。停止状态仍用 0 和 -3 个线程构造的存活对象验证，不调用已析构对象。
+
+下一步按学习进度完善空任务、普通 Submit 任务异常和部分线程创建失败时的回收；独立 Stop 接口和动态扩缩容尚未实现。
 
 先由学习者写代码，再一起检查、验证、提交；不提前填完后续答案。
 
 起点依据：你在另一个仓库 cpp-learing 中的 StudentManagement2.0 已使用类、构造函数、vector、引用和文件读写。
-项目最初以 thread 和 join 为起点，目前已推进到线程数量校验、提交状态检查、析构排空和模板任务返回值。
+项目最初以 thread 和 join 为起点，目前已推进到线程数量校验、提交状态检查、析构排空、模板任务返回值和带参数任务提交。
 
 ## 第一版的边界
 
@@ -44,11 +46,11 @@ SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测
 先学习普通函数，再介绍 lambda 和 std::function，不要求自己编写模板。
 提交任务后唤醒工作线程；工作线程等待任务、取任务、释放锁、执行任务，再继续等待。
 停止时拒绝新任务，执行完已接收任务，唤醒并 join 所有工作线程。
-第一版不加入 future、packaged_task、可变参数模板、动态扩缩容或无锁队列；当前阶段已在第一版基础上加入 future、packaged_task 和模板版 SubmitNew，返回值不再限于 int。
+第一版不加入 future、packaged_task、可变参数模板、动态扩缩容或无锁队列；当前阶段已在第一版基础上加入 future、packaged_task 和模板版 SubmitNew，并已扩展可变参数模板与完美转发，返回值不再限于 int。
 
 ## 原定路线与验收
 
-实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常及线程创建失败处理仍未完成；返回值扩展已完成模板版 SubmitNew。下表保留最初学习路线，实际进度以上述里程碑为准。
+实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常及线程创建失败处理仍未完成；返回值扩展已完成模板版 SubmitNew 和带参数任务提交。下表保留最初学习路线，实际进度以上述里程碑为准。
 
 | 阶段 | 你要动手完成的内容 | 要掌握的知识 | 验收后提交信息 |
 | --- | --- | --- | --- |
@@ -59,19 +61,21 @@ SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测
 | 4 | 封装 ThreadPool，构造时启动固定数量 worker | `vector<thread>`、构造与析构、共享状态、禁止复制 | feat(thread-pool): complete fixed size thread pool |
 | 5（部分完成） | 已实现析构排空与回收，继续完善停止边界和验证 | 停止标志、notify_all、排空任务、join、资源释放 | feat(thread-pool): complete graceful shutdown |
 | 6（已完成） | 从 SubmitInt 扩展为模板版 SubmitNew，获取不同类型任务结果 | C++17、invoke_result_t、packaged_task、future、shared_ptr | feat: generalize task submission with template futures |
+| 7（已完成） | 带参数任务提交，支持不同返回类型和参数列表 | Args...、std::bind、std::forward、转发引用 | feat: support parameterized tasks with perfect forwarding |
 
 每阶段流程：你写代码 → 解释关键语句 → 一起检查并运行验收 → 更新这里的真实进度 → commit 并同步 GitHub。
 未完成的练习不标记完成；阶段较大时可以保存明确注明 WIP 的进度，但不算验收完成。
-返回值与模板泛化已推进到第六阶段，后续扩展仍按实际掌握情况决定。
+返回值与模板泛化已推进到第七阶段，后续扩展仍按实际掌握情况决定。
 
 ## 模板任务提交与返回值
 
-`SubmitNew(F task)` 接收一个可无参数调用的任务，返回 `std::future<std::invoke_result_t<F>>`：
+`SubmitNew(F&& task, Arges&&... arges)` 接收任务和参数，返回 `std::future<std::invoke_result_t<F, Arges...>>`。`Arges...` 是代码中的类型参数包名称，通常也写作 `Args...`；空参数包仍支持原来的无参任务：
 
-1. `std::invoke_result_t<F>` 推导任务的返回类型 `ReturnType`，因此当前编译标准需要 C++17。
-2. `std::packaged_task<ReturnType()>` 包装任务，通过 `get_future()` 获取对应的 `std::future<ReturnType>`。
-3. packaged_task 不可拷贝，使用 `std::shared_ptr` 持有它，再由捕获该指针的可拷贝 lambda 包装成 `void()` 任务，放入现有队列。
-4. worker 执行包装任务，结果或异常写入共享状态；调用方通过 `future.get()` 等待并取得结果，或接收任务异常。
+1. `std::invoke_result_t<F, Arges...>` 推导任务的返回类型 `ReturnType`，因此当前编译标准需要 C++17。
+2. `std::bind(std::forward<F>(task), std::forward<Arges>(arges)...)` 将函数和参数绑定成无参任务；`F&&` 与 `Arges&&...` 为转发引用，`std::forward` 保留传入 bind 时的值类别。
+3. 将 boundTask 用 `std::move` 移入 `std::packaged_task<ReturnType()>`，避免拷贝仅可移动绑定对象；通过 `get_future()` 获取对应的 `std::future<ReturnType>`。
+4. packaged_task 不可拷贝，使用 `std::shared_ptr` 持有它，再由捕获该指针的可拷贝 lambda 包装成 `void()` 任务，放入现有队列。
+5. worker 执行包装任务，结果或异常写入共享状态；调用方通过 `future.get()` 等待并取得结果，或接收任务异常。
 
 ```cpp
 ThreadPool pool(3);
@@ -84,7 +88,21 @@ double d = decimal.get();
 std::string s = text.get();
 ```
 
-示例需包含 `ThreadPool.h` 和 `<string>`。当前接口不直接接收额外参数，需要时可通过 lambda 捕获参数；尚未实现可变参数与完美转发。
+示例需包含 `ThreadPool.h` 和 `<string>`。带参数任务可以直接提交：
+
+```cpp
+int add(int a, int b) { return a + b; }
+
+// 在调用函数中：
+ThreadPool pool(3);
+auto sum = pool.SubmitNew(add, 10, 20); // sum.get() == 30
+std::string prefix = "hello";
+auto text = pool.SubmitNew([](std::string a, std::string b) {
+    return a + " " + b;
+}, prefix, std::string("pool")); // text.get() == "hello pool"
+```
+
+`std::bind` 默认按值保存衰减后的参数：左值拷贝、右值可移动；要修改原对象，请显式使用 `std::ref`，并保证原对象活到任务结束。完美转发发生在构造绑定对象时，bind 执行时通常把保存的普通参数作为左值传递，因此当前设计不支持所有仅接受右值引用的任务，也不能直接把绑定的 unique_ptr 按值移交给任务；可让任务接收其 const 引用，或使用捕获所有权的 lambda。队列与 worker 设计保持不变。
 
 ## 基础复习：创建并等待一个线程
 
@@ -119,7 +137,7 @@ c++ -std=c++17 -Wall -Wextra -pedantic -pthread main.cpp ThreadPool.cpp -o main
 
 Windows 可将两个 cpp 和头文件加入同一个 Visual Studio C++ 控制台项目，使用 C++17。main.cpp 是唯一入口，不要只编译它。
 
-成功时最后输出“测试结束：15/15 通过”，退出码为 0；worker 的创建日志允许交错。
+成功时最后输出“测试结束：23/23 通过”，退出码为 0；worker 的创建日志允许交错。
 
 ## 后续阶段的正确性要求
 

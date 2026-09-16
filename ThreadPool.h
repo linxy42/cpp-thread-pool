@@ -7,7 +7,9 @@
 #include<queue>
 #include<future>
 #include<type_traits>
-
+#include <memory>
+#include <utility>
+#include <stdexcept>
 
 class ThreadPool{
 public:
@@ -17,11 +19,15 @@ bool Submit(const std::function<void()>& task);
 
 std::future<int> SubmitInt(const std::function<int()>& task);
 
-template<typename F>
-std::future<std::invoke_result_t<F>> SubmitNew(F task)
+template<typename F,typename... Arges>
+std::future<std::invoke_result_t<F,Arges...>> SubmitNew(F&& task,Arges&&...arges)
 {
-    using ReturnType = std::invoke_result_t<F>;
-    std::packaged_task<ReturnType()>Task(task);
+    using ReturnType = std::invoke_result_t<F,Arges...>;
+    auto boundTask=std::bind(
+                   std::forward<F>(task),
+                   std::forward<Arges>(arges)...
+    );
+    std::packaged_task<ReturnType()>Task(std::move(boundTask));
     std::future<ReturnType> result=Task.get_future();
     std::unique_lock<std::mutex> lock(mtx);
     if(running){
