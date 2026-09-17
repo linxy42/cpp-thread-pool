@@ -33,44 +33,51 @@ for(int i=0;i<threadpoolCount;++i){
             temporary= this->tasks.front();
             this->tasks.pop();
             lock.unlock();
+            this->activeCount++;
+            try{
             temporary();
+            }
+            catch(const std::exception& e){
+                std::cerr << e.what();
+            }
+            catch(...){
+
+            }
+            this->activeCount--;
             }
         }
     });
 }
 }
 
- bool ThreadPool::Submit(const std::function<void()>& task){
-    std::unique_lock<std::mutex> lock(mtx);
-    if(running){
-    tasks.push(task);
-    lock.unlock();
+bool ThreadPool::Submit(const std::function<void()>& task)
+{
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        if (!running)
+        {
+            return false;
+        }
+        else{
+        tasks.push(task);
+        }
+    }
+
     condition.notify_one();
     return true;
-    }
-    else{
-        return false;
-    }
 }
 
-std::future<int> ThreadPool::SubmitInt(const std::function<int()>&task){
-    std::packaged_task<int()>Task(task);
-   std::future<int> result=Task.get_future();
-   std::unique_lock<std::mutex> lock(mtx);
-   if(running){
-    auto taskptr=std::make_shared<std::packaged_task<int()>>(std::move(Task));
-    auto wrapperTask=[taskptr](){
-        (*taskptr)();
-    };
-    tasks.push(wrapperTask);
-    lock.unlock();
-    condition.notify_one();
-    return result;
-   }
-   else{
-    throw std::runtime_error("ThreadPool has stopped");
-   }
+size_t ThreadPool::GetTaskCount() const
+{
+        std::lock_guard<std::mutex> lock(mtx);
+        return tasks.size();
 }
+
+std::size_t ThreadPool::GetActiveCount() const{
+    return activeCount.load();
+}
+
 
 ThreadPool::~ThreadPool(){
      {

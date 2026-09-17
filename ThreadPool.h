@@ -10,6 +10,8 @@
 #include <memory>
 #include <utility>
 #include <stdexcept>
+#include <cstddef>
+#include <atomic>
 
 class ThreadPool{
 public:
@@ -17,43 +19,56 @@ ThreadPool(int threadpoolCount);
 
 bool Submit(const std::function<void()>& task);
 
-std::future<int> SubmitInt(const std::function<int()>& task);
 
-template<typename F,typename... Arges>
-std::future<std::invoke_result_t<F,Arges...>> SubmitNew(F&& task,Arges&&...arges)
+template<typename F, typename... Arges>
+std::future<std::invoke_result_t<F, Arges...>>
+SubmitNew(F&& task, Arges&&... arges)
 {
-    using ReturnType = std::invoke_result_t<F,Arges...>;
-    auto boundTask=std::bind(
-                   std::forward<F>(task),
-                   std::forward<Arges>(arges)...
+    using ReturnType = std::invoke_result_t<F, Arges...>;
+
+    auto boundTask = std::bind(
+        std::forward<F>(task),
+        std::forward<Arges>(arges)...
     );
-    std::packaged_task<ReturnType()>Task(std::move(boundTask));
-    std::future<ReturnType> result=Task.get_future();
-    std::unique_lock<std::mutex> lock(mtx);
-    if(running){
-        auto taskptr=std::make_shared<std::packaged_task<ReturnType()>>(std::move(Task));
-    auto wrapperTask=[taskptr](){
+
+    std::packaged_task<ReturnType()> Task(std::move(boundTask));
+    std::future<ReturnType> result = Task.get_future();
+
+    auto taskptr =
+        std::make_shared<std::packaged_task<ReturnType()>>(std::move(Task));
+
+    auto wrapperTask = [taskptr]()
+    {
         (*taskptr)();
     };
-    tasks.push(wrapperTask);
-    lock.unlock();
+
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        if (!running)
+        {
+            throw std::runtime_error("ThreadPool has stopped");
+        }
+        else{
+        tasks.push(wrapperTask);
+        }
+    }
+
     condition.notify_one();
     return result;
-    }
-    else{
-        throw std::runtime_error("ThreadPool has stopped");
-    }
 }
 
+std::size_t GetTaskCount ()const;
 
-
+std::size_t GetActiveCount() const;
 
 ~ThreadPool();
 
 private:
 std::vector<std::thread> workers;
-std::mutex mtx;
+mutable std::mutex mtx;
 std::condition_variable condition;
 std::queue <std::function<void()>> tasks;
 bool running=true;
+std::atomic<std::size_t> activeCount{0};
 };

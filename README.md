@@ -4,7 +4,7 @@
 
 ## 当前进度
 
-当前已在模板返回值的基础上，完成第七阶段：可变参数模板 `SubmitNew(F&& task, Arges&&... arges)`，支持带参数任务、不同返回类型和参数列表。当前项目使用 **C++17**。
+当前已在带参数任务提交的基础上，完成第八阶段：等待任务数、活动任务数统计和普通任务异常隔离。保留 `SubmitNew(F&& task, Arges&&... arges)` 的带参数任务和 future 返回值功能。当前项目使用 **C++17**。
 
 已实现能力：
 
@@ -12,12 +12,16 @@
 - 使用 `std::mutex` 保护任务队列和运行状态，配合 `std::condition_variable` 等待与唤醒；worker 取出任务后释放锁，再执行任务。
 - 析构时设置停止状态，唤醒所有 worker，执行完已接收的任务，再逐一 `join()`，实现优雅停止。
 - `Submit` 支持无参数的 `void` 任务：接受任务返回 `true`，线程池不运行时返回 `false`。
-- `SubmitNew` 使用可变参数模板、`std::bind` 和 `std::forward` 接收任务及参数，自动推导返回类型，返回对应的 `std::future`；线程池不运行时抛出 `std::runtime_error`。原有 `SubmitInt` 接口仍保留。
+- `SubmitNew` 使用可变参数模板、`std::bind` 和 `std::forward` 接收任务及参数，自动推导返回类型，返回对应的 `std::future`；线程池不运行时抛出 `std::runtime_error`。原有 `SubmitInt` 接口已移除，返回值任务统一使用 `SubmitNew`。
+- `GetTaskCount()` 读取等待队列中的任务数（queued task count），在锁内调用 `tasks.size()`，不包含已取出的任务。
+- `GetActiveCount()` 读取正在执行的任务数（active task count）；使用 `std::atomic<std::size_t> activeCount{0}` 和 `load()`，多个 worker 的递增、递减不会丢失更新。
+- `Submit` / `SubmitNew` 使用 `std::lock_guard`，在同一锁内检查 `running` 并入队，离开作用域释放锁后再通知 worker。
+- worker 在任务调用前递增活动数，通过 `try/catch` 隔离普通任务的标准和未知异常，正常或异常返回后都递减活动数；单个任务失败不影响后续任务执行。
 
 项目结构：
 
 - `ThreadPool.h`：类声明、成员和模板版 `SubmitNew` 的完整定义，使用 pragma once 防止重复包含；模板定义放在头文件中，供调用处实例化。
-- `ThreadPool.cpp`：构造函数、worker 循环、`Submit`、`SubmitInt` 和析构函数的实现。
+- `ThreadPool.cpp`：构造函数、worker 循环、`Submit`、两个统计接口和析构函数的实现。
 - `main.cpp`：23 个独立测试，每组输出 PASS/FAIL；失败返回非零退出码。
 - `.vscode/tasks.json`：默认任务同时编译 main.cpp 和 ThreadPool.cpp；run 依赖 build。
 - `.vscode/launch.json`：启动前执行完整构建，调试生成的 main。
@@ -26,14 +30,16 @@
 验证（2026-09-13）：C++17 多文件编译通过，开启 Wall/Wextra/Werror/pedantic 无警告；5/5 测试通过。
 测试分别覆盖空池析构、0 和 -3 拒绝重复提交、1 和 3 个 worker 将 20 个任务各执行一次。每个池离开作用域后才核对结果，主线程不通过 sleep 猜测完成时间。此测试覆盖多 worker 下的正确性，不测吞吐量或证明并行加速。
 
-目前没有独立 Stop 接口，调用方须在析构开始前停止并等待所有提交线程；任务不得销毁自身线程池。未处理空任务、void Submit 任务异常、部分线程创建失败；这些边界仍待完善。`SubmitInt` 和 `SubmitNew` 的任务异常已由 packaged_task 保存，并在 `future.get()` 时重新抛出。
+目前没有独立 Stop 接口，调用方须在析构开始前停止并等待所有提交线程；任务不得销毁自身线程池。普通 `Submit` 任务异常已在 worker 内捕获；空任务尚未在提交时主动拒绝，部分线程创建失败时的回收仍待完善。`SubmitNew` 的任务异常由 packaged_task 保存，并在 `future.get()` 时重新抛出。
 SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测试通过。新增覆盖单个 int 返回值、100 个 int 任务、void/int 混合提交、执行中及排队 int 任务的析构排空、停止池重复提交异常，以及任务异常经 future 传递后 worker 继续执行。停止路径用 0 和 -3 个线程构造的存活对象验证，不在析构后调用成员函数。
 
 模板阶段验证（2026-09-16）：C++17 严格编译无警告，15/15 测试通过。在原有 11 项基础上，新增不同返回值与对应 future 类型检查、Submit/SubmitNew 混合提交及析构排空、停止池重复提交异常、任务异常经 future 传递后 worker 继续执行。
 
 带参数阶段验证（2026-09-16）：C++17 严格编译无警告，23/23 测试通过。新增普通函数 add、多参数 lambda、string 返回值和左值/右值参数、std::ref、左值 callable 与仅可移动对象、带参数任务与 Submit 混合执行及析构排空、停止状态重复提交异常、任务异常传递测试。停止状态仍用 0 和 -3 个线程构造的存活对象验证，不调用已析构对象。
 
-下一步按学习进度完善空任务、普通 Submit 任务异常和部分线程创建失败时的回收；独立 Stop 接口和动态扩缩容尚未实现。
+任务统计阶段验证（2026-09-17）：C++17 严格编译无警告，当前 23/23 测试通过。移除旧 SubmitInt 的 6 项专用测试，新增 2 项队列统计测试和 4 项活动计数、异常隔离测试；其余 SubmitNew/future 回归测试保留。通过 promise 控制任务开始和释放，验证 queued 为 6、单 worker 的 active 为 1、3 个 worker 并发时 active 为 3，以及任务结束后归零；普通 Submit 抛出 runtime_error 或未知异常后，后续 Submit 与带参数 future 任务仍能执行。
+
+下一步按学习进度加入 **RAII 活动计数保护**，替代当前手动对应的递增/递减；继续完善空任务拒绝和部分线程创建失败时的回收。独立 Stop 接口和动态扩缩容尚未实现。
 
 先由学习者写代码，再一起检查、验证、提交；不提前填完后续答案。
 
@@ -50,7 +56,7 @@ SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测
 
 ## 原定路线与验收
 
-实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常及线程创建失败处理仍未完成；返回值扩展已完成模板版 SubmitNew 和带参数任务提交。下表保留最初学习路线，实际进度以上述里程碑为准。
+实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常隔离已完成，线程创建失败处理仍未完成；返回值扩展已完成模板版 SubmitNew 和带参数任务提交，本阶段已加入任务统计。下表保留最初学习路线，实际进度以上述里程碑为准。
 
 | 阶段 | 你要动手完成的内容 | 要掌握的知识 | 验收后提交信息 |
 | --- | --- | --- | --- |
@@ -62,10 +68,11 @@ SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测
 | 5（部分完成） | 已实现析构排空与回收，继续完善停止边界和验证 | 停止标志、notify_all、排空任务、join、资源释放 | feat(thread-pool): complete graceful shutdown |
 | 6（已完成） | 从 SubmitInt 扩展为模板版 SubmitNew，获取不同类型任务结果 | C++17、invoke_result_t、packaged_task、future、shared_ptr | feat: generalize task submission with template futures |
 | 7（已完成） | 带参数任务提交，支持不同返回类型和参数列表 | Args...、std::bind、std::forward、转发引用 | feat: support parameterized tasks with perfect forwarding |
+| 8（已完成） | 等待任务数、活动任务数与普通任务异常隔离 | mutable mutex、lock_guard、atomic、try/catch | feat: track queued and active tasks |
 
 每阶段流程：你写代码 → 解释关键语句 → 一起检查并运行验收 → 更新这里的真实进度 → commit 并同步 GitHub。
 未完成的练习不标记完成；阶段较大时可以保存明确注明 WIP 的进度，但不算验收完成。
-返回值与模板泛化已推进到第七阶段，后续扩展仍按实际掌握情况决定。
+任务统计与异常隔离已推进到第八阶段，RAII 计数保护留到下一阶段。
 
 ## 模板任务提交与返回值
 
@@ -103,6 +110,14 @@ auto text = pool.SubmitNew([](std::string a, std::string b) {
 ```
 
 `std::bind` 默认按值保存衰减后的参数：左值拷贝、右值可移动；要修改原对象，请显式使用 `std::ref`，并保证原对象活到任务结束。完美转发发生在构造绑定对象时，bind 执行时通常把保存的普通参数作为左值传递，因此当前设计不支持所有仅接受右值引用的任务，也不能直接把绑定的 unique_ptr 按值移交给任务；可让任务接收其 const 引用，或使用捕获所有权的 lambda。队列与 worker 设计保持不变。
+
+## 任务数量统计与异常隔离
+
+- `GetTaskCount() const`：只统计仍在队列中等待的任务，使用 `mutable std::mutex` 支持 const 查询时加锁。
+- `GetActiveCount() const`：读取原子活动计数，包含普通 Submit 和 SubmitNew 的任务执行；执行前 `++`，正常完成或 catch 处理后 `--`。
+- 两个查询都是瞬时观察，不构成联合快照。worker 出队、解锁后才增加活动数，因此两个数不能作为“全部任务已经完成”的判断；应使用 future 或析构等待。future 就绪也可能早于 worker 的减计数，测试会另外等待活动数归零。
+- 普通 Submit 的 `std::exception` 会输出 `what()`，其他异常由 `catch (...)` 捕获；SubmitNew 的异常仍通过 `future.get()` 传递。当前验证采用默认日志流设置，后续健壮性优化还需考虑日志输出本身抛异常的情况。
+- 本阶段保持手动计数，尚未引入 RAII 计数保护。
 
 ## 基础复习：创建并等待一个线程
 

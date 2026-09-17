@@ -78,108 +78,6 @@ bool Report(bool passed, const char* name) {
     return passed;
 }
 
-bool TestIntResult() {
-    ThreadPool pool(2);
-    auto result = pool.SubmitInt([] { return 42; });
-    return Report(result.get() == 42, "SubmitInt 返回 42");
-}
-
-bool TestMultipleIntResults() {
-    ThreadPool pool(4);
-    std::vector<std::future<int>> results;
-    for (int i = 0; i < 100; ++i) {
-        results.push_back(pool.SubmitInt([i] { return i * i - 7; }));
-    }
-    bool passed = true;
-    for (int i = 0; i < 100; ++i) {
-        if (results[i].get() != i * i - 7) passed = false;
-    }
-    return Report(passed, "100 个 int 任务全部返回正确结果");
-}
-
-bool TestMixedSubmissions() {
-    std::atomic<int> voidCount{0};
-    std::vector<std::future<int>> results;
-    bool passed = true;
-    {
-        ThreadPool pool(3);
-        for (int i = 0; i < 50; ++i) {
-            if (!pool.Submit([&voidCount] { ++voidCount; })) passed = false;
-            results.push_back(pool.SubmitInt([i] { return i + 10; }));
-        }
-    }
-    for (int i = 0; i < 50; ++i) {
-        if (results[i].get() != i + 10) passed = false;
-    }
-    return Report(passed && voidCount == 50, "50 个 void 与 50 个 int 混合执行");
-}
-
-bool TestPendingIntShutdown() {
-    std::promise<void> started;
-    std::promise<void> release;
-    auto gate = release.get_future().share();
-    auto pool = std::make_unique<ThreadPool>(1);
-    auto active = pool->SubmitInt([&started, gate] {
-        started.set_value();
-        gate.wait();
-        return 123;
-    });
-    started.get_future().wait();
-    // 唯一 worker 被 gate 阻塞，后面的任务必定还在队列中。
-    auto queued = pool->SubmitInt([] { return 456; });
-    bool pending = active.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout
-        && queued.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
-    std::promise<void> destroying;
-    auto destructionStarted = destroying.get_future();
-    auto shutdown = std::async(std::launch::async,
-        [owned = std::move(pool), &destroying]() mutable {
-            destroying.set_value();
-            owned.reset();
-        });
-    destructionStarted.wait();
-    bool waited = shutdown.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout;
-    release.set_value();
-    shutdown.get();
-    bool ready = active.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready
-        && queued.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
-    int activeValue = active.get();
-    int queuedValue = queued.get();
-    return Report(pending && waited && ready && activeValue == 123 && queuedValue == 456,
-                  "析构等待执行中任务、排空队列，析构后 future 可取");
-}
-
-bool TestStoppedIntSubmission() {
-    bool passed = true;
-    bool executed = false;
-    for (int count : {0, -3}) {
-        ThreadPool pool(count);
-        for (int i = 0; i < 2; ++i) {
-            try {
-                pool.SubmitInt([&executed] { executed = true; return 1; });
-                passed = false;
-            } catch (const std::runtime_error&) {
-                // 再次提交也能抛异常，验证异常退出会释放锁。
-            } catch (...) {
-                passed = false;
-            }
-        }
-    }
-    return Report(passed && !executed, "停止池重复 SubmitInt 抛出 runtime_error");
-}
-
-bool TestIntTaskException() {
-    ThreadPool pool(1);
-    auto failed = pool.SubmitInt([]() -> int { throw std::runtime_error("task failed"); });
-    auto next = pool.SubmitInt([] { return 99; });
-    bool caught = false;
-    try {
-        failed.get();
-    } catch (const std::runtime_error&) {
-        caught = true;
-    }
-    return Report(caught && next.get() == 99, "int 任务异常由 future 传递，worker 继续执行");
-}
-
 bool TestTemplateResults() {
     ThreadPool pool(3);
     auto integer = pool.SubmitNew([] { return 42; });
@@ -374,35 +272,182 @@ bool TestParameterizedException() {
     return Report(caught && continued, "带参数任务异常经 future 传递，worker 继续执行");
 }
 
+// 用 promise 控制 worker，而不是用 sleep 猜测队列状态。
+bool TestTaskCount() {
+    std::promise<void> started;
+    std::promise<void> release;
+    auto startedFuture = started.get_future();
+    auto gate = release.get_future().share();
+    std::atomic<int> completed{0};
+    bool passed = true;
+    {
+        ThreadPool pool(1);
+        const ThreadPool& view = pool;
+        passed = view.GetTaskCount() == 0;
+        auto active = pool.SubmitNew([&started, gate] {
+            started.set_value();
+            gate.wait();
+        });
+        startedFuture.wait();
+        // 唯一 worker 正在执行任务，但队列为空。
+        passed = (view.GetTaskCount() == 0) && passed;
+        passed = (active.wait_for(std::chrono::milliseconds(0))
+                  == std::future_status::timeout) && passed;
+        for (int i = 0; i < 5; ++i) {
+            passed = pool.Submit([&completed] { ++completed; }) && passed;
+        }
+        auto queued = pool.SubmitNew([] { return 42; });
+        passed = (view.GetTaskCount() == 6) && passed;
+        // 无论检查成功与否，都先放行 worker，避免析构一直等待。
+        release.set_value();
+        active.get();
+        const bool resultOk = queued.get() == 42;
+        passed = resultOk && (completed == 5) && passed;
+        passed = (view.GetTaskCount() == 0) && passed;
+    }
+    return Report(passed, "GetTaskCount：空池 0、执行中 0、排队 6、完成后 0（含 const 调用）");
+}
+
+bool TestStoppedTaskCount() {
+    bool passed = true;
+    for (int count : {0, -3}) {
+        ThreadPool pool(count);
+        passed = (pool.GetTaskCount() == 0 && pool.GetActiveCount() == 0) && passed;
+        passed = !pool.Submit([] {}) && passed;
+        passed = (pool.GetTaskCount() == 0) && passed;
+    }
+    return Report(passed, "停止池拒绝任务后 GetTaskCount 仍为 0");
+}
+
+// future 就绪发生在 worker 执行 activeCount-- 之前，因此另外等待计数归零。
+// 超时用于报告失败；任务是否已经开始由 promise 确认，不靠 sleep 猜测。
+bool WaitForIdleCount(const ThreadPool& pool) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (pool.GetActiveCount() != 0) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+bool TestActiveCount(int workerCount) {
+    std::promise<void> release;
+    auto gate = release.get_future().share();
+    std::vector<std::promise<void>> started(workerCount);
+    std::vector<std::future<void>> entered;
+    for (auto& signal : started) entered.push_back(signal.get_future());
+    std::atomic<int> completed{0};
+    ThreadPool pool(workerCount);
+    const ThreadPool& view = pool;
+    bool passed = view.GetActiveCount() == 0 && view.GetTaskCount() == 0;
+    std::vector<std::future<void>> results;
+    for (int i = 0; i < workerCount; ++i) {
+        auto task = [&, i, gate] {
+            started[i].set_value();
+            gate.wait();
+            ++completed;
+        };
+        if (i % 2 == 0) passed = pool.Submit(task) && passed;
+        else results.push_back(pool.SubmitNew(task));
+    }
+    for (auto& signal : entered) {
+        passed = (signal.wait_for(std::chrono::seconds(5))
+                  == std::future_status::ready) && passed;
+    }
+    passed = (view.GetActiveCount() == static_cast<std::size_t>(workerCount)) && passed;
+    passed = (view.GetTaskCount() == 0) && passed;
+    for (int i = 0; i < 6; ++i) {
+        passed = pool.Submit([&completed] { ++completed; }) && passed;
+    }
+    passed = (view.GetTaskCount() == 6) && passed;
+    passed = (view.GetActiveCount() == static_cast<std::size_t>(workerCount)) && passed;
+    release.set_value();
+    for (auto& result : results) result.get();
+    // 完成数确认所有普通任务已进入任务体末尾，再检查 worker 的计数收尾。
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (completed != workerCount + 6 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    passed = (completed == workerCount + 6) && passed;
+    passed = WaitForIdleCount(view) && passed;
+    passed = (view.GetTaskCount() == 0) && passed;
+    return Report(passed, workerCount == 1
+        ? "单 worker：active 0→1→0，queued 0→6→0（含 const 调用）"
+        : "3 个 worker 同时执行：active 为 3，queued 为 6，结束后均归零");
+}
+
+bool TestPlainTaskException(bool unknownException) {
+    std::promise<void> started;
+    auto entered = started.get_future();
+    std::promise<void> release;
+    auto gate = release.get_future().share();
+    std::promise<void> nextDone;
+    auto nextResult = nextDone.get_future();
+    ThreadPool pool(1);
+    bool passed = pool.Submit([&started, gate, unknownException] {
+        started.set_value();
+        gate.wait();
+        if (unknownException) throw 7;
+        throw std::runtime_error("expected Submit exception");
+    });
+    passed = (entered.wait_for(std::chrono::seconds(5))
+              == std::future_status::ready) && passed;
+    passed = (pool.GetActiveCount() == 1) && passed;
+    passed = pool.Submit([&nextDone] { nextDone.set_value(); }) && passed;
+    auto futureResult = pool.SubmitNew([](int x) { return x + 1; }, 41);
+    release.set_value();
+    passed = (nextResult.wait_for(std::chrono::seconds(5))
+              == std::future_status::ready) && passed;
+    const bool ready = futureResult.wait_for(std::chrono::seconds(5))
+        == std::future_status::ready;
+    passed = ready && passed;
+    if (ready) passed = (futureResult.get() == 42) && passed;
+    passed = WaitForIdleCount(pool) && passed;
+    passed = (pool.GetTaskCount() == 0) && passed;
+    return Report(passed, unknownException
+        ? "Submit 未知异常被隔离，后续 Submit/future 正常，active 归零"
+        : "Submit runtime_error 被隔离，后续 Submit/future 正常，active 归零");
+}
+
 int main() {
+    int total = 0;
     int failures = 0;
-    if (!TestEmptyPool()) ++failures;
-    if (!TestInvalidCount(0)) ++failures;
-    if (!TestInvalidCount(-3)) ++failures;
-    if (!TestTaskCompletion(1)) ++failures;
-    if (!TestTaskCompletion(3)) ++failures;
+    auto check = [&](bool passed) {
+        ++total;
+        if (!passed) ++failures;
+    };
 
-    if (!TestIntResult()) ++failures;
-    if (!TestMultipleIntResults()) ++failures;
-    if (!TestMixedSubmissions()) ++failures;
-    if (!TestPendingIntShutdown()) ++failures;
-    if (!TestStoppedIntSubmission()) ++failures;
-    if (!TestIntTaskException()) ++failures;
+    // Submit：基础提交、无效线程数与析构排空。
+    check(TestEmptyPool());
+    check(TestInvalidCount(0));
+    check(TestInvalidCount(-3));
+    check(TestTaskCompletion(1));
+    check(TestTaskCompletion(3));
 
-    if (!TestTemplateResults()) ++failures;
-    if (!TestTemplateMixedSubmissions()) ++failures;
-    if (!TestStoppedTemplateSubmission()) ++failures;
-    if (!TestTemplateTaskException()) ++failures;
+    // SubmitNew：返回类型、混合提交、停止状态与异常传递。
+    check(TestTemplateResults());
+    check(TestTemplateMixedSubmissions());
+    check(TestStoppedTemplateSubmission());
+    check(TestTemplateTaskException());
 
-    if (!TestParameterizedFunction()) ++failures;
-    if (!TestParameterizedLambda()) ++failures;
-    if (!TestParameterizedStrings()) ++failures;
-    if (!TestParameterizedMixed()) ++failures;
-    if (!TestParameterizedException()) ++failures;
-    if (!TestBoundReference()) ++failures;
-    if (!TestMoveOnlyBinding()) ++failures;
-    if (!TestStoppedParameterized()) ++failures;
+    // SubmitNew：可变参数、引用与仅可移动对象。
+    check(TestParameterizedFunction());
+    check(TestParameterizedLambda());
+    check(TestParameterizedStrings());
+    check(TestParameterizedMixed());
+    check(TestParameterizedException());
+    check(TestBoundReference());
+    check(TestMoveOnlyBinding());
+    check(TestStoppedParameterized());
 
-    std::cout << "测试结束：" << (23 - failures) << "/23 通过\n";
+    // GetTaskCount：只统计等待中的任务。
+    check(TestTaskCount());
+    check(TestStoppedTaskCount());
+    check(TestActiveCount(1));
+    check(TestActiveCount(3));
+    check(TestPlainTaskException(false));
+    check(TestPlainTaskException(true));
+
+    std::cout << "测试结束：" << (total - failures) << "/" << total << " 通过\n";
     return failures == 0 ? 0 : 1;
 }
