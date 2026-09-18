@@ -138,7 +138,7 @@ bool TestStoppedTemplateSubmission() {
     bool passed = true;
     bool executed = false;
     for (int count : {0, -3}) {
-        // 没有公开 Stop 接口，用无效线程数构造仍存活的停止池。
+        // 用无效线程数构造仍存活的停止池，覆盖构造边界。
         ThreadPool pool(count);
         for (int i = 0; i < 2; ++i) {
             try {
@@ -489,6 +489,120 @@ bool TestStoppedStatus() {
     return Report(passed, "0/-3 停止池：重复拒绝提交前后 running 为 false，四项状态一致");
 }
 
+
+// Shutdown 回归：去掉拒绝、排空、等待或 worker 自调用检查均应失败。
+bool RejectsSubmission(ThreadPool& pool) {
+    try { pool.Submit([] { return 42; }); }
+    catch (const std::runtime_error&) { return true; }
+    return false;
+}
+
+bool WaitForClosing(const ThreadPool& pool) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (pool.IsRunning()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+bool TestExplicitShutdown() {
+    ThreadPool pool(3);
+    std::vector<std::future<int>> results;
+    for (int i = 0; i < 100; ++i) results.push_back(pool.Submit(add, i, 1));
+    pool.Shutdown();
+    bool passed = !pool.IsRunning() && pool.GetTaskCount() == 0 &&
+        pool.GetActiveCount() == 0 && pool.GetWorkerCount() == 3;
+    for (int i = 0; i < 100; ++i) passed = (results[i].get() == i + 1) && passed;
+    passed = RejectsSubmission(pool) && passed;
+    pool.Shutdown();
+    passed = RejectsSubmission(pool) && !pool.IsRunning() && passed;
+    return Report(passed, "显式 Shutdown 排空任务、状态归零、拒绝提交且重复调用安全");
+}
+
+bool TestConcurrentShutdown() {
+    std::promise<void> entered, release, secondEntered;
+    auto gate = release.get_future().share();
+    auto started = entered.get_future();
+    auto secondStarted = secondEntered.get_future();
+    ThreadPool pool(1);
+    auto active = pool.Submit([&entered, gate] { entered.set_value(); gate.wait(); });
+    started.wait();
+    std::vector<std::future<int>> queued;
+    for (int i = 0; i < 20; ++i) queued.push_back(pool.Submit(add, i, 10));
+    auto first = std::async(std::launch::async, [&pool] { pool.Shutdown(); });
+    bool passed = WaitForClosing(pool);
+    passed = RejectsSubmission(pool) && passed;
+    auto second = std::async(std::launch::async, [&] {
+        secondEntered.set_value();
+        pool.Shutdown();
+        return pool.GetActiveCount() == 0 && pool.GetTaskCount() == 0 && !pool.IsRunning();
+    });
+    secondStarted.wait();
+    // promise 保证阻塞任务已进入；有限观察窗口检查 Shutdown 没有提前返回。
+    passed = (first.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout) && passed;
+    passed = (second.wait_for(std::chrono::milliseconds(30)) == std::future_status::timeout) && passed;
+    passed = (pool.GetTaskCount() == 20 && pool.GetActiveCount() == 1) && passed;
+    release.set_value();
+    first.get();
+    passed = second.get() && passed;
+    active.get();
+    for (int i = 0; i < 20; ++i) passed = (queued[i].get() == i + 10) && passed;
+    pool.Shutdown();
+    return Report(passed, "两个外部 Shutdown 等待活动及队列任务，关闭中拒绝提交，关闭后均返回");
+}
+
+bool TestWorkerShutdown(bool closing) {
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    auto started = entered.get_future();
+    ThreadPool pool(1);
+    auto rejected = pool.Submit([&] {
+        entered.set_value();
+        gate.wait();
+        pool.Shutdown();
+    });
+    started.wait();
+    auto next = pool.Submit([] { return 7; });
+    bool passed = true;
+    std::future<void> external;
+    if (closing) {
+        external = std::async(std::launch::async, [&] { pool.Shutdown(); });
+        passed = WaitForClosing(pool);
+    }
+    release.set_value();
+    bool caught = false;
+    try { rejected.get(); }
+    catch (const std::runtime_error& error) {
+        caught = std::string(error.what()) == "worker thread cannot call Shutdown";
+    }
+    passed = caught && (next.get() == 7) && passed;
+    if (closing) external.get();
+    else passed = pool.IsRunning() && passed;
+    pool.Shutdown();
+    return Report(passed, closing ? "关闭中的 worker 自调用被拒绝，不与外部 join 死锁"
+                                  : "运行中的 worker 自调用由 future 传递异常，池继续工作");
+}
+
+bool TestSimultaneousShutdown() {
+    bool passed = true;
+    for (int round = 0; round < 50; ++round) {
+        ThreadPool pool(3);
+        std::promise<void> release;
+        auto gate = release.get_future().share();
+        auto result = pool.Submit([] { return 42; });
+        std::vector<std::future<void>> callers;
+        for (int i = 0; i < 4; ++i) callers.push_back(std::async(std::launch::async, [&pool, gate] {
+            gate.wait(); pool.Shutdown();
+        }));
+        release.set_value();
+        for (auto& caller : callers) caller.get();
+        passed = (result.get() == 42 && !pool.IsRunning() &&
+            pool.GetTaskCount() == 0 && pool.GetActiveCount() == 0) && passed;
+    }
+    return Report(passed, "50 轮四个外部线程同时 Shutdown，无重复 join 或死锁");
+}
+
 int main() {
     int total = 0;
     int failures = 0;
@@ -530,6 +644,12 @@ int main() {
     check(TestVoidTaskException(true));
     check(TestRunningStatus());
     check(TestStoppedStatus());
+
+    check(TestExplicitShutdown());
+    check(TestConcurrentShutdown());
+    check(TestWorkerShutdown(false));
+    check(TestWorkerShutdown(true));
+    check(TestSimultaneousShutdown());
 
     std::cout << "测试结束：" << (total - failures) << "/" << total << " 通过\n";
     return failures == 0 ? 0 : 1;

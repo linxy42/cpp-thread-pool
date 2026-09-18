@@ -13,6 +13,13 @@
 #include <cstddef>
 #include <atomic>
 
+enum class State
+{
+    Running,
+    ShuttingDown,
+    Stopped
+};
+
 class ThreadPool{
 public:
 ThreadPool(int threadpoolCount);
@@ -44,7 +51,7 @@ Submit(F&& task, Arges&&... arges)
     {
         std::lock_guard<std::mutex> lock(mtx);
 
-        if (!running)
+        if (state!=State::Running)
         {
             throw std::runtime_error("ThreadPool has stopped");
         }
@@ -65,6 +72,8 @@ std::size_t GetWorkerCount() const;
 
 bool IsRunning() const;
 
+void Shutdown();
+
 ~ThreadPool();
 
 private:
@@ -72,8 +81,9 @@ std::vector<std::thread> workers;
 mutable std::mutex mtx;
 std::condition_variable condition;
 std::queue <std::function<void()>> tasks;
-bool running=true;
+State state=State::Running;
 std::atomic<std::size_t> activeCount{0};
+std::condition_variable shutdownCondition;
 };
 
 
