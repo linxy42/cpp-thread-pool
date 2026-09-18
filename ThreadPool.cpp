@@ -33,17 +33,18 @@ for(int i=0;i<threadpoolCount;++i){
             temporary= this->tasks.front();
             this->tasks.pop();
             lock.unlock();
-            this->activeCount++;
+                {
+            ActiveTaskGuard guard(this->activeCount);
             try{
             temporary();
             }
             catch(const std::exception& e){
-                std::cerr << e.what();
+                std::cerr<< "任务执行异常: " << e.what();
             }
             catch(...){
-
+                std::cerr<<"任务执行发生未知异常" << std::endl;
             }
-            this->activeCount--;
+                }
             }
         }
     });
@@ -90,4 +91,12 @@ ThreadPool::~ThreadPool(){
         workers[i].join();
         }
 }
+}
+
+ActiveTaskGuard::ActiveTaskGuard(std::atomic<std::size_t> &Count):activeCount(Count){
+    activeCount++;
+}
+
+ActiveTaskGuard::~ActiveTaskGuard(){
+    activeCount--;
 }

@@ -72,3 +72,14 @@ std::queue <std::function<void()>> tasks;
 bool running=true;
 std::atomic<std::size_t> activeCount{0};
 };
+
+
+class ActiveTaskGuard{
+ public:
+ActiveTaskGuard(std::atomic<std::size_t> &Count);
+
+~ActiveTaskGuard();
+
+private:
+std::atomic<std::size_t> &activeCount;
+};

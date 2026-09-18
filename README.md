@@ -4,7 +4,7 @@
 
 ## 当前进度
 
-当前已在带参数任务提交的基础上，完成第八阶段：等待任务数、活动任务数统计和普通任务异常隔离。保留 `SubmitNew(F&& task, Arges&&... arges)` 的带参数任务和 future 返回值功能。当前项目使用 **C++17**。
+当前已在任务统计和普通任务异常隔离的基础上，完成第九阶段：使用 RAII 管理活动任务计数。保留 `SubmitNew(F&& task, Arges&&... arges)` 的带参数任务和 future 返回值功能。当前项目使用 **C++17**。
 
 已实现能力：
 
@@ -16,12 +16,12 @@
 - `GetTaskCount()` 读取等待队列中的任务数（queued task count），在锁内调用 `tasks.size()`，不包含已取出的任务。
 - `GetActiveCount()` 读取正在执行的任务数（active task count）；使用 `std::atomic<std::size_t> activeCount{0}` 和 `load()`，多个 worker 的递增、递减不会丢失更新。
 - `Submit` / `SubmitNew` 使用 `std::lock_guard`，在同一锁内检查 `running` 并入队，离开作用域释放锁后再通知 worker。
-- worker 在任务调用前递增活动数，通过 `try/catch` 隔离普通任务的标准和未知异常，正常或异常返回后都递减活动数；单个任务失败不影响后续任务执行。
+- worker 使用局部 `ActiveTaskGuard` 管理活动数：构造时递增，离开作用域时自动递减；通过 `try/catch` 隔离普通任务的标准和未知异常，单个任务失败不影响后续任务执行。RAII 将计数收尾绑定到对象生命周期，避免维护任务处理逻辑时遗漏手动递减。
 
 项目结构：
 
 - `ThreadPool.h`：类声明、成员和模板版 `SubmitNew` 的完整定义，使用 pragma once 防止重复包含；模板定义放在头文件中，供调用处实例化。
-- `ThreadPool.cpp`：构造函数、worker 循环、`Submit`、两个统计接口和析构函数的实现。
+- `ThreadPool.cpp`：构造函数、worker 循环、`Submit`、两个统计接口、析构函数及 `ActiveTaskGuard` 的实现。
 - `main.cpp`：23 个独立测试，每组输出 PASS/FAIL；失败返回非零退出码。
 - `.vscode/tasks.json`：默认任务同时编译 main.cpp 和 ThreadPool.cpp；run 依赖 build。
 - `.vscode/launch.json`：启动前执行完整构建，调试生成的 main。
@@ -39,7 +39,9 @@ SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测
 
 任务统计阶段验证（2026-09-17）：C++17 严格编译无警告，当前 23/23 测试通过。移除旧 SubmitInt 的 6 项专用测试，新增 2 项队列统计测试和 4 项活动计数、异常隔离测试；其余 SubmitNew/future 回归测试保留。通过 promise 控制任务开始和释放，验证 queued 为 6、单 worker 的 active 为 1、3 个 worker 并发时 active 为 3，以及任务结束后归零；普通 Submit 抛出 runtime_error 或未知异常后，后续 Submit 与带参数 future 任务仍能执行。
 
-下一步按学习进度加入 **RAII 活动计数保护**，替代当前手动对应的递增/递减；继续完善空任务拒绝和部分线程创建失败时的回收。独立 Stop 接口和动态扩缩容尚未实现。
+RAII 阶段验证（2026-09-18）：C++17 多文件严格编译（Wall/Wextra/Werror/pedantic）无警告，23/23 测试通过。正常任务执行时 active 为 1，3 个 worker 同时执行时 active 为 3，完成后均归零；普通 Submit 抛出 std::runtime_error 或未知异常后计数仍归零，worker 继续执行后续 Submit 和 SubmitNew 任务。GetTaskCount、带参数任务、future 返回值与异常传递等现有回归测试全部通过。复用现有 promise 同步测试，无需修改测试或修复 RAII 实现。
+
+下一步按学习进度继续完善空任务拒绝和部分线程创建失败时的回收。独立 Stop 接口和动态扩缩容尚未实现。
 
 先由学习者写代码，再一起检查、验证、提交；不提前填完后续答案。
 
@@ -56,7 +58,7 @@ SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测
 
 ## 原定路线与验收
 
-实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常隔离已完成，线程创建失败处理仍未完成；返回值扩展已完成模板版 SubmitNew 和带参数任务提交，本阶段已加入任务统计。下表保留最初学习路线，实际进度以上述里程碑为准。
+实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常隔离已完成，线程创建失败处理仍未完成；返回值扩展已完成模板版 SubmitNew 和带参数任务提交，已加入任务统计，本阶段完成 RAII 活动计数保护。下表保留最初学习路线，实际进度以上述里程碑为准。
 
 | 阶段 | 你要动手完成的内容 | 要掌握的知识 | 验收后提交信息 |
 | --- | --- | --- | --- |
@@ -69,10 +71,11 @@ SubmitInt 阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测
 | 6（已完成） | 从 SubmitInt 扩展为模板版 SubmitNew，获取不同类型任务结果 | C++17、invoke_result_t、packaged_task、future、shared_ptr | feat: generalize task submission with template futures |
 | 7（已完成） | 带参数任务提交，支持不同返回类型和参数列表 | Args...、std::bind、std::forward、转发引用 | feat: support parameterized tasks with perfect forwarding |
 | 8（已完成） | 等待任务数、活动任务数与普通任务异常隔离 | mutable mutex、lock_guard、atomic、try/catch | feat: track queued and active tasks |
+| 9（已完成） | 使用 ActiveTaskGuard 自动管理活动任务计数 | RAII、引用成员、初始化列表、作用域与析构 | refactor: manage active task count with RAII |
 
 每阶段流程：你写代码 → 解释关键语句 → 一起检查并运行验收 → 更新这里的真实进度 → commit 并同步 GitHub。
 未完成的练习不标记完成；阶段较大时可以保存明确注明 WIP 的进度，但不算验收完成。
-任务统计与异常隔离已推进到第八阶段，RAII 计数保护留到下一阶段。
+任务统计与异常隔离已完成第八阶段，RAII 计数保护已完成第九阶段；后续继续补齐已有边界。
 
 ## 模板任务提交与返回值
 
@@ -114,10 +117,10 @@ auto text = pool.SubmitNew([](std::string a, std::string b) {
 ## 任务数量统计与异常隔离
 
 - `GetTaskCount() const`：只统计仍在队列中等待的任务，使用 `mutable std::mutex` 支持 const 查询时加锁。
-- `GetActiveCount() const`：读取原子活动计数，包含普通 Submit 和 SubmitNew 的任务执行；执行前 `++`，正常完成或 catch 处理后 `--`。
+- `GetActiveCount() const`：读取原子活动计数，包含普通 Submit 和 SubmitNew 的任务执行；worker 创建局部 guard 时 `++`，正常完成或 catch 处理后离开作用域，由 guard 析构执行 `--`。
 - 两个查询都是瞬时观察，不构成联合快照。worker 出队、解锁后才增加活动数，因此两个数不能作为“全部任务已经完成”的判断；应使用 future 或析构等待。future 就绪也可能早于 worker 的减计数，测试会另外等待活动数归零。
 - 普通 Submit 的 `std::exception` 会输出 `what()`，其他异常由 `catch (...)` 捕获；SubmitNew 的异常仍通过 `future.get()` 传递。当前验证采用默认日志流设置，后续健壮性优化还需考虑日志输出本身抛异常的情况。
-- 本阶段保持手动计数，尚未引入 RAII 计数保护。
+- `ActiveTaskGuard` 持有 `std::atomic<std::size_t>&`，通过构造函数初始化列表绑定线程池的计数器；构造时 `activeCount++`，析构时 `activeCount--`。worker 在任务执行的小作用域内创建 `ActiveTaskGuard guard(this->activeCount)`，不再手动配对递增和递减。RAII 负责计数清理，任务异常仍由 worker 的 try/catch 隔离。
 
 ## 基础复习：创建并等待一个线程
 
