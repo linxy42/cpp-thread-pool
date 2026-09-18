@@ -28,10 +28,15 @@ bool TestInvalidCount(int threadCount) {
         ThreadPool pool(threadCount);
         // 连续提交两次，也检查失败返回后锁是否自动释放。
         for (int i = 0; i < 2; ++i) {
-            bool accepted = pool.Submit([&executed]() { executed = true; });
-            if (accepted) {
+            try {
+                pool.Submit([&executed]() { executed = true; });
+                rejected = false;
+            } catch (const std::runtime_error& error) {
+                rejected = rejected && std::string(error.what()) == "ThreadPool has stopped";
+            } catch (...) {
                 rejected = false;
             }
+            rejected = (pool.GetTaskCount() == 0) && rejected;
         }
     }
     bool passed = rejected && !executed;
@@ -49,11 +54,11 @@ bool TestTaskCompletion(int threadCount) {
     {
         ThreadPool pool(threadCount);
         for (int i = 0; i < taskCount; ++i) {
-            bool accepted = pool.Submit([i, &executionCounts, &resultMutex]() {
+            auto accepted = pool.Submit([i, &executionCounts, &resultMutex]() {
                 std::lock_guard<std::mutex> lock(resultMutex);
                 ++executionCounts[i];
             });
-            if (!accepted) {
+            if (!accepted.valid()) {
                 allAccepted = false;
             }
         }
@@ -78,11 +83,26 @@ bool Report(bool passed, const char* name) {
     return passed;
 }
 
+bool TestVoidFuture() {
+    int count = 0;
+    ThreadPool pool(1);
+    auto result = pool.Submit([&count] { ++count; });
+    static_assert(std::is_same_v<decltype(result), std::future<void>>);
+    const bool valid = result.valid();
+    result.get();
+    std::function<void()> callable = [&count] { ++count; };
+    auto wrapped = pool.Submit(callable);
+    static_assert(std::is_same_v<decltype(wrapped), std::future<void>>);
+    wrapped.get();
+    return Report(valid && !result.valid() && count == 2,
+                  "void lambda 和 std::function 均返回 future<void>，get 等待完成");
+}
+
 bool TestTemplateResults() {
     ThreadPool pool(3);
-    auto integer = pool.SubmitNew([] { return 42; });
-    auto decimal = pool.SubmitNew([] { return 3.25; });
-    auto text = pool.SubmitNew([] { return std::string("thread pool"); });
+    auto integer = pool.Submit([] { return 42; });
+    auto decimal = pool.Submit([] { return 3.25; });
+    auto text = pool.Submit([] { return std::string("thread pool"); });
     static_assert(std::is_same_v<decltype(integer), std::future<int>>);
     static_assert(std::is_same_v<decltype(decimal), std::future<double>>);
     static_assert(std::is_same_v<decltype(text), std::future<std::string>>);
@@ -90,26 +110,28 @@ bool TestTemplateResults() {
     const bool doubleOk = decimal.get() == 3.25;
     const bool stringOk = text.get() == "thread pool";
     return Report(intOk && doubleOk && stringOk,
-                  "SubmitNew 正确返回 int、double、string 及对应 future 类型");
+                  "Submit 正确返回 int、double、string 及对应 future 类型");
 }
 
 bool TestTemplateMixedSubmissions() {
     std::atomic<int> voidCount{0};
+    std::vector<std::future<void>> voidResults;
     std::vector<std::future<int>> results;
     bool passed = true;
     {
         ThreadPool pool(3);
         for (int i = 0; i < 50; ++i) {
-            if (!pool.Submit([&voidCount] { ++voidCount; })) passed = false;
-            results.push_back(pool.SubmitNew([i] { return i * 2; }));
+            voidResults.push_back(pool.Submit([&voidCount] { ++voidCount; }));
+            results.push_back(pool.Submit([i] { return i * 2; }));
         }
         // 析构排空队列后，再读取任务结果。
     }
     for (int i = 0; i < 50; ++i) {
         if (results[i].get() != i * 2) passed = false;
     }
+    for (auto& result : voidResults) result.get();
     return Report(passed && voidCount == 50,
-                  "Submit 与 SubmitNew 混合执行，析构后 future 可取");
+                  "void 与 int 任务混合执行，析构后 future 可取");
 }
 
 bool TestStoppedTemplateSubmission() {
@@ -120,7 +142,7 @@ bool TestStoppedTemplateSubmission() {
         ThreadPool pool(count);
         for (int i = 0; i < 2; ++i) {
             try {
-                pool.SubmitNew([&executed] { executed = true; return 1; });
+                pool.Submit([&executed] { executed = true; return 1; });
                 passed = false;
             } catch (const std::runtime_error& error) {
                 if (std::string(error.what()) != "ThreadPool has stopped") passed = false;
@@ -130,15 +152,15 @@ bool TestStoppedTemplateSubmission() {
         }
     }
     return Report(passed && !executed,
-                  "停止池重复 SubmitNew 抛异常且不执行任务");
+                  "停止池重复 Submit 抛异常且不执行任务");
 }
 
 bool TestTemplateTaskException() {
     ThreadPool pool(1);
-    auto failed = pool.SubmitNew([]() -> std::string {
+    auto failed = pool.Submit([]() -> std::string {
         throw std::runtime_error("template task failed");
     });
-    auto next = pool.SubmitNew([] { return 99; });
+    auto next = pool.Submit([] { return 99; });
     bool caught = false;
     try {
         failed.get();
@@ -147,7 +169,7 @@ bool TestTemplateTaskException() {
     }
     const bool continued = next.get() == 99;
     return Report(caught && continued,
-                  "SubmitNew 异常由 future 传递，worker 继续执行");
+                  "Submit 异常由 future 传递，worker 继续执行");
 }
 
 
@@ -155,14 +177,14 @@ int add(int a, int b) { return a + b; }
 
 bool TestParameterizedFunction() {
     ThreadPool pool(2);
-    auto result = pool.SubmitNew(add, 10, 20);
+    auto result = pool.Submit(add, 10, 20);
     static_assert(std::is_same_v<decltype(result), std::future<int>>);
     return Report(result.get() == 30, "普通函数 add 接收两个参数");
 }
 
 bool TestParameterizedLambda() {
     ThreadPool pool(2);
-    auto result = pool.SubmitNew([](int a, double b, int c) {
+    auto result = pool.Submit([](int a, double b, int c) {
         return a * b + c;
     }, 4, 2.5, 3);
     static_assert(std::is_same_v<decltype(result), std::future<double>>);
@@ -172,7 +194,7 @@ bool TestParameterizedLambda() {
 bool TestParameterizedStrings() {
     ThreadPool pool(2);
     std::string prefix = "hello";
-    auto result = pool.SubmitNew([](std::string a, std::string b) {
+    auto result = pool.Submit([](std::string a, std::string b) {
         return a + " " + b;
     }, prefix, std::string("pool"));
     static_assert(std::is_same_v<decltype(result), std::future<std::string>>);
@@ -185,9 +207,9 @@ bool TestBoundReference() {
     int value = 10;
     ThreadPool pool(1);
     auto increment = [](int& n) { return ++n; };
-    auto copied = pool.SubmitNew(increment, value);
+    auto copied = pool.Submit(increment, value);
     const bool copyOk = copied.get() == 11 && value == 10;
-    auto referenced = pool.SubmitNew(increment, std::ref(value));
+    auto referenced = pool.Submit(increment, std::ref(value));
     const bool refOk = referenced.get() == 11 && value == 11;
     return Report(copyOk && refOk, "bind 默认拷贝左值，std::ref 修改原值");
 }
@@ -206,9 +228,9 @@ bool TestMoveOnlyBinding() {
         return *owned + n;
     };
     LvalueCallable lvalueCallable;
-    auto lvalue = pool.SubmitNew(lvalueCallable, 8);
-    auto result = pool.SubmitNew(std::move(callable), 2);
-    auto argument = pool.SubmitNew([](const std::unique_ptr<int>& n) {
+    auto lvalue = pool.Submit(lvalueCallable, 8);
+    auto result = pool.Submit(std::move(callable), 2);
+    auto argument = pool.Submit([](const std::unique_ptr<int>& n) {
         return *n;
     }, std::make_unique<int>(7));
     const bool callableOk = result.get() == 42;
@@ -225,10 +247,10 @@ bool TestParameterizedMixed() {
     {
         ThreadPool pool(3);
         for (int i = 0; i < 50; ++i) {
-            if (!pool.Submit([&count] { ++count; })) accepted = false;
-            results.push_back(pool.SubmitNew(add, i, 10));
+            if (!pool.Submit([&count] { ++count; }).valid()) accepted = false;
+            results.push_back(pool.Submit(add, i, 10));
         }
-        voidResult = pool.SubmitNew([](std::atomic<int>& n, int amount) {
+        voidResult = pool.Submit([](std::atomic<int>& n, int amount) {
             n.fetch_add(amount);
         }, std::ref(count), 5);
     }
@@ -247,7 +269,7 @@ bool TestStoppedParameterized() {
         ThreadPool pool(count);
         for (int i = 0; i < 2; ++i) {
             try {
-                pool.SubmitNew([&executed](int n) { executed = true; return n; }, i);
+                pool.Submit([&executed](int n) { executed = true; return n; }, i);
                 passed = false;
             } catch (const std::runtime_error& error) {
                 if (std::string(error.what()) != "ThreadPool has stopped") passed = false;
@@ -259,10 +281,10 @@ bool TestStoppedParameterized() {
 
 bool TestParameterizedException() {
     ThreadPool pool(1);
-    auto failed = pool.SubmitNew([](std::string message) -> int {
+    auto failed = pool.Submit([](std::string message) -> int {
         throw std::runtime_error(message);
     }, std::string("parameterized failure"));
-    auto next = pool.SubmitNew(add, 2, 3);
+    auto next = pool.Submit(add, 2, 3);
     bool caught = false;
     try { failed.get(); }
     catch (const std::runtime_error& error) {
@@ -284,7 +306,7 @@ bool TestTaskCount() {
         ThreadPool pool(1);
         const ThreadPool& view = pool;
         passed = view.GetTaskCount() == 0;
-        auto active = pool.SubmitNew([&started, gate] {
+        auto active = pool.Submit([&started, gate] {
             started.set_value();
             gate.wait();
         });
@@ -294,9 +316,9 @@ bool TestTaskCount() {
         passed = (active.wait_for(std::chrono::milliseconds(0))
                   == std::future_status::timeout) && passed;
         for (int i = 0; i < 5; ++i) {
-            passed = pool.Submit([&completed] { ++completed; }) && passed;
+            passed = pool.Submit([&completed] { ++completed; }).valid() && passed;
         }
-        auto queued = pool.SubmitNew([] { return 42; });
+        auto queued = pool.Submit([] { return 42; });
         passed = (view.GetTaskCount() == 6) && passed;
         // 无论检查成功与否，都先放行 worker，避免析构一直等待。
         release.set_value();
@@ -313,7 +335,12 @@ bool TestStoppedTaskCount() {
     for (int count : {0, -3}) {
         ThreadPool pool(count);
         passed = (pool.GetTaskCount() == 0 && pool.GetActiveCount() == 0) && passed;
-        passed = !pool.Submit([] {}) && passed;
+        try {
+            pool.Submit([] {});
+            passed = false;
+        } catch (const std::runtime_error& error) {
+            passed = (std::string(error.what()) == "ThreadPool has stopped") && passed;
+        } catch (...) { passed = false; }
         passed = (pool.GetTaskCount() == 0) && passed;
     }
     return Report(passed, "停止池拒绝任务后 GetTaskCount 仍为 0");
@@ -340,6 +367,8 @@ bool TestActiveCount(int workerCount) {
     ThreadPool pool(workerCount);
     const ThreadPool& view = pool;
     bool passed = view.GetActiveCount() == 0 && view.GetTaskCount() == 0;
+    passed = view.IsRunning() &&
+        view.GetWorkerCount() == static_cast<std::size_t>(workerCount) && passed;
     std::vector<std::future<void>> results;
     for (int i = 0; i < workerCount; ++i) {
         auto task = [&, i, gate] {
@@ -347,8 +376,7 @@ bool TestActiveCount(int workerCount) {
             gate.wait();
             ++completed;
         };
-        if (i % 2 == 0) passed = pool.Submit(task) && passed;
-        else results.push_back(pool.SubmitNew(task));
+        results.push_back(pool.Submit(task));
     }
     for (auto& signal : entered) {
         passed = (signal.wait_for(std::chrono::seconds(5))
@@ -357,10 +385,12 @@ bool TestActiveCount(int workerCount) {
     passed = (view.GetActiveCount() == static_cast<std::size_t>(workerCount)) && passed;
     passed = (view.GetTaskCount() == 0) && passed;
     for (int i = 0; i < 6; ++i) {
-        passed = pool.Submit([&completed] { ++completed; }) && passed;
+        passed = pool.Submit([&completed] { ++completed; }).valid() && passed;
     }
     passed = (view.GetTaskCount() == 6) && passed;
     passed = (view.GetActiveCount() == static_cast<std::size_t>(workerCount)) && passed;
+    passed = view.IsRunning() &&
+        view.GetWorkerCount() == static_cast<std::size_t>(workerCount) && passed;
     release.set_value();
     for (auto& result : results) result.get();
     // 完成数确认所有普通任务已进入任务体末尾，再检查 worker 的计数收尾。
@@ -376,7 +406,7 @@ bool TestActiveCount(int workerCount) {
         : "3 个 worker 同时执行：active 为 3，queued 为 6，结束后均归零");
 }
 
-bool TestPlainTaskException(bool unknownException) {
+bool TestVoidTaskException(bool unknownException) {
     std::promise<void> started;
     auto entered = started.get_future();
     std::promise<void> release;
@@ -384,17 +414,17 @@ bool TestPlainTaskException(bool unknownException) {
     std::promise<void> nextDone;
     auto nextResult = nextDone.get_future();
     ThreadPool pool(1);
-    bool passed = pool.Submit([&started, gate, unknownException] {
+    auto failed = pool.Submit([&started, gate, unknownException] {
         started.set_value();
         gate.wait();
         if (unknownException) throw 7;
         throw std::runtime_error("expected Submit exception");
     });
-    passed = (entered.wait_for(std::chrono::seconds(5))
-              == std::future_status::ready) && passed;
+    bool passed = (entered.wait_for(std::chrono::seconds(5))
+              == std::future_status::ready);
     passed = (pool.GetActiveCount() == 1) && passed;
-    passed = pool.Submit([&nextDone] { nextDone.set_value(); }) && passed;
-    auto futureResult = pool.SubmitNew([](int x) { return x + 1; }, 41);
+    auto next = pool.Submit([&nextDone] { nextDone.set_value(); });
+    auto futureResult = pool.Submit([](int x) { return x + 1; }, 41);
     release.set_value();
     passed = (nextResult.wait_for(std::chrono::seconds(5))
               == std::future_status::ready) && passed;
@@ -402,11 +432,61 @@ bool TestPlainTaskException(bool unknownException) {
         == std::future_status::ready;
     passed = ready && passed;
     if (ready) passed = (futureResult.get() == 42) && passed;
+    bool caught = false;
+    try { failed.get(); }
+    catch (const std::runtime_error& error) {
+        caught = !unknownException && std::string(error.what()) == "expected Submit exception";
+    }
+    catch (int error) { caught = unknownException && error == 7; }
+    catch (...) {}
+    next.get();
+    passed = caught && passed;
     passed = WaitForIdleCount(pool) && passed;
     passed = (pool.GetTaskCount() == 0) && passed;
     return Report(passed, unknownException
-        ? "Submit 未知异常被隔离，后续 Submit/future 正常，active 归零"
-        : "Submit runtime_error 被隔离，后续 Submit/future 正常，active 归零");
+        ? "void 未知异常由 get() 传递，后续 Submit/future 正常，active 归零"
+        : "void runtime_error 由 get() 传递，后续 Submit/future 正常，active 归零");
+}
+
+bool TestRunningStatus() {
+    bool passed = true;
+    for (int count : {1, 3}) {
+        ThreadPool pool(count);
+        const ThreadPool& view = pool;
+        passed = (view.IsRunning() &&
+                  view.GetWorkerCount() == static_cast<std::size_t>(count)) && passed;
+        auto result = pool.Submit([&view, count] {
+            return view.IsRunning() &&
+                view.GetWorkerCount() == static_cast<std::size_t>(count);
+        });
+        const bool taskStatus = result.get();
+        passed = taskStatus && WaitForIdleCount(view) && passed;
+        passed = (view.IsRunning() && view.GetTaskCount() == 0 &&
+                  view.GetWorkerCount() == static_cast<std::size_t>(count)) && passed;
+    }
+    return Report(passed, "1/3 个 worker：构造后、任务内、完成后运行状态及线程数正确");
+}
+
+bool TestStoppedStatus() {
+    bool passed = true;
+    for (int count : {0, -3}) {
+        // 对象仍存活；没有公开 Stop，不与析构并发调用成员函数。
+        ThreadPool pool(count);
+        const ThreadPool& view = pool;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            passed = (!view.IsRunning() && view.GetWorkerCount() == 0 &&
+                      view.GetTaskCount() == 0 && view.GetActiveCount() == 0) && passed;
+            try {
+                auto result = pool.Submit([] { return 42; });
+                passed = false;
+            } catch (const std::runtime_error& error) {
+                passed = (std::string(error.what()) == "ThreadPool has stopped") && passed;
+            } catch (...) { passed = false; }
+        }
+        passed = (!view.IsRunning() && view.GetWorkerCount() == 0 &&
+                  view.GetTaskCount() == 0 && view.GetActiveCount() == 0) && passed;
+    }
+    return Report(passed, "0/-3 停止池：重复拒绝提交前后 running 为 false，四项状态一致");
 }
 
 int main() {
@@ -424,13 +504,14 @@ int main() {
     check(TestTaskCompletion(1));
     check(TestTaskCompletion(3));
 
-    // SubmitNew：返回类型、混合提交、停止状态与异常传递。
+    // Submit：返回类型、混合提交、停止状态与异常传递。
+    check(TestVoidFuture());
     check(TestTemplateResults());
     check(TestTemplateMixedSubmissions());
     check(TestStoppedTemplateSubmission());
     check(TestTemplateTaskException());
 
-    // SubmitNew：可变参数、引用与仅可移动对象。
+    // Submit：可变参数、引用与仅可移动对象。
     check(TestParameterizedFunction());
     check(TestParameterizedLambda());
     check(TestParameterizedStrings());
@@ -445,8 +526,10 @@ int main() {
     check(TestStoppedTaskCount());
     check(TestActiveCount(1));
     check(TestActiveCount(3));
-    check(TestPlainTaskException(false));
-    check(TestPlainTaskException(true));
+    check(TestVoidTaskException(false));
+    check(TestVoidTaskException(true));
+    check(TestRunningStatus());
+    check(TestStoppedStatus());
 
     std::cout << "测试结束：" << (total - failures) << "/" << total << " 通过\n";
     return failures == 0 ? 0 : 1;

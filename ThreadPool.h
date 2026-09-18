@@ -17,12 +17,11 @@ class ThreadPool{
 public:
 ThreadPool(int threadpoolCount);
 
-bool Submit(const std::function<void()>& task);
 
 
 template<typename F, typename... Arges>
 std::future<std::invoke_result_t<F, Arges...>>
-SubmitNew(F&& task, Arges&&... arges)
+Submit(F&& task, Arges&&... arges)
 {
     using ReturnType = std::invoke_result_t<F, Arges...>;
 
@@ -61,6 +60,10 @@ SubmitNew(F&& task, Arges&&... arges)
 std::size_t GetTaskCount ()const;
 
 std::size_t GetActiveCount() const;
+
+std::size_t GetWorkerCount() const;
+
+bool IsRunning() const;
 
 ~ThreadPool();
 

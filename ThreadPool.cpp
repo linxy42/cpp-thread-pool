@@ -51,25 +51,7 @@ for(int i=0;i<threadpoolCount;++i){
 }
 }
 
-bool ThreadPool::Submit(const std::function<void()>& task)
-{
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-
-        if (!running)
-        {
-            return false;
-        }
-        else{
-        tasks.push(task);
-        }
-    }
-
-    condition.notify_one();
-    return true;
-}
-
-size_t ThreadPool::GetTaskCount() const
+std::size_t ThreadPool::GetTaskCount() const
 {
         std::lock_guard<std::mutex> lock(mtx);
         return tasks.size();
@@ -79,6 +61,14 @@ std::size_t ThreadPool::GetActiveCount() const{
     return activeCount.load();
 }
 
+std::size_t ThreadPool::GetWorkerCount() const{
+    return workers.size();
+}
+
+bool ThreadPool::IsRunning() const{
+    std::lock_guard<std::mutex> lock(mtx);
+    return running;
+}
 
 ThreadPool::~ThreadPool(){
      {
