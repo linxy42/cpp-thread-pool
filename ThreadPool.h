@@ -20,11 +20,16 @@ enum class State
     Stopped
 };
 
+enum class RejectPolicy
+{
+    Abort,
+    CallerRuns,
+    Discard
+};
+
 class ThreadPool{
 public:
-ThreadPool(int threadpoolCount,std::size_t queueSize=100);
-
-
+ThreadPool(int threadpoolCount,std::size_t queueSize=100,RejectPolicy policy = RejectPolicy::Abort);
 
 template<typename F, typename... Arges>
 std::future<std::invoke_result_t<F, Arges...>>
@@ -47,7 +52,8 @@ Submit(F&& task, Arges&&... arges)
     {
         (*taskptr)();
     };
-
+        bool callerRuns=false;
+        bool discard = false;
     {
         std::lock_guard<std::mutex> lock(mtx);
 
@@ -57,10 +63,34 @@ Submit(F&& task, Arges&&... arges)
         }
         else{
             if(tasks.size()>=maxQueueSize){
+                if (rejectPolicy == RejectPolicy::Abort){
                 throw std::runtime_error("ThreadPool task queue is full");
+                }
+                else if(rejectPolicy == RejectPolicy::CallerRuns){
+                    callerRuns=true;
+                }
+                else if(rejectPolicy == RejectPolicy::Discard){
+                    discard=true;
+                }
             }
-        tasks.push(wrapperTask);
+            else{
+                tasks.push(wrapperTask);
+            }
         }
+    }
+    if(callerRuns){
+        wrapperTask();
+        return result;
+    }
+    if(discard){
+        std::promise<ReturnType> rejectedPromise;
+        std::future<ReturnType> rejectedFuture=rejectedPromise.get_future();
+        rejectedPromise.set_exception(
+                std::make_exception_ptr(
+                    std::runtime_error("ThreadPool task was discarded")
+                )
+        );
+        return rejectedFuture;
     }
 
     condition.notify_one();
@@ -88,6 +118,7 @@ State state=State::Running;
 std::atomic<std::size_t> activeCount{0};
 std::condition_variable shutdownCondition;
 std::size_t maxQueueSize;
+RejectPolicy rejectPolicy;
 };
 
 

@@ -17,7 +17,7 @@ bool NumberJudgment(int threadpoolCount){
     return true;
 }
 
-ThreadPool::ThreadPool(int threadpoolCount,std::size_t queueSize):maxQueueSize(queueSize){
+ThreadPool::ThreadPool(int threadpoolCount,std::size_t queueSize,RejectPolicy policy):maxQueueSize(queueSize),rejectPolicy(policy){
    if(!NumberJudgment(threadpoolCount)){
    throw std::invalid_argument("threadpoolCount must be greater than 0");
    }

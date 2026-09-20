@@ -4,17 +4,17 @@
 
 ## 当前进度
 
-当前已在 RAII 活动任务计数的基础上，完成统一提交接口：仅保留模板版 `Submit(F&& task, Arges&&... arges)`，支持 void、不同返回类型和带参数任务，统一返回对应 future；已补齐 `GetTaskCount()`、`GetActiveCount()`、`GetWorkerCount()`、`IsRunning()` 四个状态查询接口。此前已完成 `Running / ShuttingDown / Stopped` 三态生命周期及显式 `Shutdown()`，支持幂等和多个外部线程并发关闭，析构统一调用 `Shutdown()`。本阶段完成有界任务队列、构造参数校验和满队列拒绝。当前项目使用 **C++17**。
+当前已在 RAII 活动任务计数的基础上，完成统一提交接口：仅保留模板版 `Submit(F&& task, Arges&&... arges)`，支持 void、不同返回类型和带参数任务，统一返回对应 future；已补齐 `GetTaskCount()`、`GetActiveCount()`、`GetWorkerCount()`、`IsRunning()` 四个状态查询接口。此前已完成 `Running / ShuttingDown / Stopped` 三态生命周期及显式 `Shutdown()`，支持幂等和多个外部线程并发关闭，析构统一调用 `Shutdown()`。本阶段完成可配置拒绝策略 Abort / CallerRuns / Discard，保留有界队列和构造参数校验。当前项目使用 **C++17**。
 
 已实现能力：
 
 - 固定数量的 worker 线程池，使用 `std::queue<std::function<void()>>` 保存任务。
-- 有界等待队列：构造参数 `queueSize` 默认为 100，由 `maxQueueSize` 保存；队列满时拒绝新任务，非法线程数或零队列容量在创建 worker 前抛异常。
+- 有界等待队列：构造参数 `queueSize` 默认为 100，由 `maxQueueSize` 保存；队列满时按 Abort / CallerRuns / Discard 处理新任务，非法线程数或零队列容量在创建 worker 前抛异常。
 - 使用 `std::mutex` 保护任务队列和运行状态，配合 `std::condition_variable` 等待与唤醒；worker 取出任务后释放锁，再执行任务。
 - 显式 `Shutdown()` 或析构触发优雅关闭：停止接收任务，唤醒所有 worker，执行完已接收的任务，再逐一 `join()`；关闭完成后重复调用直接返回。
 - `Submit` 使用可变参数模板、`std::bind` 和 `std::forward` 接收任务及参数，自动推导返回类型，返回对应的 `std::future`；线程池不运行时抛出 `std::runtime_error`。旧 bool 提交接口已移除；int 专用接口此前已移除。void 任务同样返回 `std::future<void>`，用 `get()` 等待完成并接收异常。
 - `GetTaskCount()` 读取等待队列中的任务数（queued task count），在锁内调用 `tasks.size()`，不包含已取出的任务。
-- `GetActiveCount()` 读取正在执行的任务数（active task count）；使用 `std::atomic<std::size_t> activeCount{0}` 和 `load()`，多个 worker 的递增、递减不会丢失更新。
+- `GetActiveCount()` 读取 worker 正在执行的任务数（active task count），不包含 CallerRuns；使用 `std::atomic<std::size_t> activeCount{0}` 和 `load()`，多个 worker 的递增、递减不会丢失更新。
 - `GetWorkerCount()` 返回固定 worker 数量；`IsRunning()` 在锁内读取是否仍接受任务，正常构造为 true，关闭中及关闭后为 false；无效构造参数直接抛异常。
 - 模板版 `Submit` 使用 `std::lock_guard`，在同一锁内检查 `state == State::Running`、队列容量并入队，离开作用域释放锁后再通知 worker。
 - worker 使用局部 `ActiveTaskGuard` 管理活动数：构造时递增，离开作用域时自动递减；任务异常由 packaged_task 保存，worker 保留 `try/catch` 外层保护，单个任务失败不影响后续任务执行。RAII 将计数收尾绑定到对象生命周期，避免维护任务处理逻辑时遗漏手动递减。
@@ -23,7 +23,7 @@
 
 - `ThreadPool.h`：类声明、成员和模板版 `Submit` 的完整定义，使用 pragma once 防止重复包含；模板定义放在头文件中，供调用处实例化。
 - `ThreadPool.cpp`：构造函数、worker 循环、四个状态查询接口、Shutdown、析构函数及 `ActiveTaskGuard` 的实现。
-- `main.cpp`：37 个独立测试，每组输出 PASS/FAIL；失败返回非零退出码。
+- `main.cpp`：45 个独立测试，每组输出 PASS/FAIL；失败返回非零退出码。
 - `.vscode/tasks.json`：默认任务同时编译 main.cpp 和 ThreadPool.cpp；run 依赖 build。
 - `.vscode/launch.json`：启动前执行完整构建，调试生成的 main。
 - `.gitignore`：忽略可执行文件、目标文件和 macOS 调试产物。
@@ -48,7 +48,7 @@ RAII 阶段验证（2026-09-18）：C++17 多文件严格编译（Wall/Wextra/We
 
 以上早期验证记录描述当时的接口行为；当前 API 以统一模板为准。停止状态提交统一抛出 `std::runtime_error("ThreadPool has stopped")`，不再返回 bool。早期测试用 0/-3 个线程构造的存活停止池验证拒绝行为；当前无效线程数在构造时抛异常，停止状态测试已统一改用显式 Shutdown 后仍存活的对象，不在析构开始后调用 Submit。
 
-当前已完成有界队列与满队列抛异常拒绝；下一步可按学习进度完善拒绝策略（Abort / CallerRuns / Discard）、整理测试与文档并准备基础版收尾。空任务主动拒绝和部分线程创建失败时的回收仍待完善，动态扩缩容属于后续进阶内容。
+当前已完成有界队列及三种可配置拒绝策略（Abort / CallerRuns / Discard），并补齐本阶段测试与文档；下一步可按学习进度准备基础版收尾。空任务主动拒绝和部分线程创建失败时的回收仍待完善，动态扩缩容属于后续进阶内容。
 
 先由学习者写代码，再一起检查、验证、提交；不提前填完后续答案。
 
@@ -65,7 +65,7 @@ RAII 阶段验证（2026-09-18）：C++17 多文件严格编译（Wall/Wextra/We
 
 ## 原定路线与验收
 
-实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常隔离已完成，线程创建失败处理仍未完成；返回值扩展已完成模板版 Submit 和带参数任务提交，已加入任务统计与 RAII 活动计数保护，已完成统一 Submit 和四个状态查询接口，已补齐三态生命周期与并发 Shutdown，本阶段完成有界任务队列与构造参数校验。下表保留最初学习路线，实际进度以上述里程碑为准。
+实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常隔离已完成，线程创建失败处理仍未完成；返回值扩展已完成模板版 Submit 和带参数任务提交，已加入任务统计与 RAII 活动计数保护，已完成统一 Submit 和四个状态查询接口，已补齐三态生命周期与并发 Shutdown，本阶段完成可配置拒绝策略及对应 future 语义验证。下表保留最初学习路线，实际进度以上述里程碑为准。
 
 | 阶段 | 你要动手完成的内容 | 要掌握的知识 | 验收后提交信息 |
 | --- | --- | --- | --- |
@@ -82,20 +82,21 @@ RAII 阶段验证（2026-09-18）：C++17 多文件严格编译（Wall/Wextra/We
 | 10（已完成） | 统一 Submit，完善队列数、活动数、worker 数及运行状态查询 | 统一模板 API、const 查询、互斥锁与原子计数、对象生命周期 | refactor: unify submit API and add thread pool status queries |
 | 11（已完成） | 三态生命周期、显式及并发 Shutdown、析构统一关闭 | State、条件变量谓词、关闭负责人、thread_local worker 身份 | feat: add thread pool shutdown state machine |
 | 12（已完成） | 有界任务队列、构造参数校验、满队列拒绝 | maxQueueSize、std::invalid_argument、锁内容量检查、同步边界测试 | feat: add bounded task queue and input validation |
+| 13（已完成） | 可配置 Abort / CallerRuns / Discard 拒绝策略 | 枚举策略、锁外执行、promise 异常与 future 语义 | feat: add configurable task rejection policies |
 
 每阶段流程：你写代码 → 解释关键语句 → 一起检查并运行验收 → 更新这里的真实进度 → commit 并同步 GitHub。
 未完成的练习不标记完成；阶段较大时可以保存明确注明 WIP 的进度，但不算验收完成。
-任务统计与异常隔离已完成第八阶段，RAII 计数保护已完成第九阶段，统一提交与状态查询已完成第十阶段；后续继续补齐空任务拒绝与部分线程创建失败的回收，第十一阶段已完成显式 Shutdown，第十二阶段已完成有界队列、参数校验和满队列拒绝，动态扩缩容仍未实现。
+任务统计与异常隔离已完成第八阶段，RAII 计数保护已完成第九阶段，统一提交与状态查询已完成第十阶段；后续继续补齐空任务拒绝与部分线程创建失败的回收，第十一阶段已完成显式 Shutdown，第十二阶段已完成有界队列、参数校验和满队列拒绝，第十三阶段已完成三种可配置拒绝策略，动态扩缩容仍未实现。
 
 ## 有界任务队列与构造参数校验
 
-构造接口为 `ThreadPool(int threadpoolCount, std::size_t queueSize = 100)`。`queueSize` 通过初始化列表保存到成员 `maxQueueSize`，只限制队列中等待的任务数，不包含 worker 已取出或正在执行的任务；容量固定，不随提交动态增长。
+构造接口为 `ThreadPool(int threadpoolCount, std::size_t queueSize = 100, RejectPolicy policy = RejectPolicy::Abort)`。`queueSize` 通过初始化列表保存到成员 `maxQueueSize`，只限制队列中等待的任务数，不包含 worker 已取出或正在执行的任务；容量固定，不随提交动态增长。
 
 - `threadpoolCount <= 0`：抛出 `std::invalid_argument("threadpoolCount must be greater than 0")`。
 - `queueSize == 0`：抛出 `std::invalid_argument("queueSize must be greater than 0")`。
 - 两项校验都在创建 worker 前完成；两者同时非法时，先报告线程数错误。
-- `Submit` 在 `mtx` 保护下先检查运行状态，再检查 `tasks.size() >= maxQueueSize`。队列满时立即抛出 `std::runtime_error("ThreadPool task queue is full")`，被拒绝的任务不会入队或执行，调用方也不会取得该次提交的 future。
-- 当前满队列策略只支持抛异常，不等待空位；worker 出队释放容量后可以继续提交。关闭中或关闭后仍优先抛出 `std::runtime_error("ThreadPool has stopped")`。
+- `Submit` 在 `mtx` 保护下先检查运行状态，再检查 `tasks.size() >= maxQueueSize`。默认 Abort 策略下，队列满时立即抛出 `std::runtime_error("ThreadPool task queue is full")`，被拒绝的任务不会入队或执行，调用方也不会取得该次提交的 future。
+- 满队列时按构造参数 policy 处理，不等待空位；worker 出队释放容量后可以继续提交。关闭中或关闭后仍优先抛出 `std::runtime_error("ThreadPool has stopped")`。
 
 ```cpp
 ThreadPool defaultPool(3); // 3 个 worker，默认等待队列容量 100
@@ -110,6 +111,35 @@ ThreadPool smallPool(1, 2); // 1 个 worker，最多 2 个任务等待
 - 容量 1、2 的测试通过 promise 同步阻塞 worker，再填满等待队列，验证正常提交、满队列重复拒绝、被拒绝任务不执行，以及释放容量后继续提交；不依赖 sleep 猜测满队列时机。
 - 本地附加边界测试覆盖 INT_MIN；线程创建接口监测确认非法构造期间调用次数为 0，正常创建 1 个 worker 的对照为 1。附加探针不计入仓库的 37 项测试。
 
+## 可配置任务拒绝策略
+
+构造函数通过初始化列表将 `policy` 保存到 `rejectPolicy`，默认 `RejectPolicy::Abort`，原有一参、两参构造用法保持有效。三种策略只在 Running 且等待队列已满时生效；队列未满时均正常入队，由 worker 执行。
+
+| 策略 | 满队列行为 | future 语义 | 适用含义 |
+| --- | --- | --- | --- |
+| `Abort`（默认） | Submit 当场抛出 `std::runtime_error("ThreadPool task queue is full")`，任务不执行 | 本次调用不返回 future | 需要调用方立即处理过载、重试或报告失败 |
+| `CallerRuns` | 不入队，解锁后由调用 Submit 的线程同步执行 | Submit 等执行结束才返回已就绪的 future；结果或任务异常通过 get 获取 | 允许提交线程承担工作，以降低提交速度；会增加 Submit 的耗时 |
+| `Discard` | 不入队，也不执行任务 | 返回已就绪、带异常的 future；get 抛出 `std::runtime_error("ThreadPool task was discarded")`，包括 future<void> | 允许丢弃新任务；调用方仍可通过 future 观察丢弃结果 |
+
+```cpp
+ThreadPool abortPool(3, 100); // 默认 Abort
+ThreadPool callerPool(3, 100, RejectPolicy::CallerRuns);
+ThreadPool discardPool(3, 100, RejectPolicy::Discard);
+```
+
+Discard 使用 `std::promise<ReturnType>::set_exception` 创建拒绝结果，返回的是这个 promise 对应的 future，不是原 packaged_task 的 future。因此 get 接收的是上述明确的 runtime_error；即使任务返回 void，也应调用 get 观察异常。CallerRuns 的任务异常同样由 packaged_task 保存，不会作为任务异常直接从 Submit 抛出。
+
+CallerRuns / Discard 在各自处理后直接返回，只有正常入队路径调用 `condition.notify_one()`。`GetTaskCount()` 仅统计等待队列，`GetActiveCount()` 仅统计 worker 执行，不计 CallerRuns；CallerRuns 不创建额外 worker。Shutdown 仍负责排空等待队列并等待 worker，不等待其他提交线程中尚未结束的 CallerRuns 调用；调用方必须等待所有 Submit 调用结束后再析构线程池。关闭中或关闭后，三种策略都优先抛出 `std::runtime_error("ThreadPool has stopped")`。
+
+本阶段验证（2026-09-20）：C++17 严格编译（Wall/Wextra/Werror/pedantic/pthread）无警告，45/45 测试通过，连续运行 10 次均通过；写回仓库后再次严格编译运行通过。保留原有 37 项回归并新增 8 项：
+
+- 三种策略分别验证队列满时的处理、重复提交不产生多余执行，以及关闭中和关闭后优先拒绝。
+- 三种策略分别验证队列未满时确实入队、由 worker 执行，并在释放容量后正常继续提交。
+- 单独验证 Discard 的 future<void> 抛出指定异常且任务不执行。
+- 单独验证 CallerRuns 任务异常经 future 传递、后续带参数任务正常执行；满队列测试还核对调用线程身份、锁外查询状态及返回 future 已就绪。
+
+使用 promise 固定 worker 阻塞和队列占用，不靠 sleep 猜测队列是否已满。原有 Shutdown/state machine、四项状态查询、参数校验、泛型 Submit 与异常隔离测试均通过。本阶段无需修复线程池实现，仅补充测试和文档，并提交学习者已完成的拒绝策略代码。
+
 ## 三态生命周期与显式关闭
 
 正常生命周期为 `State::Running → State::ShuttingDown → State::Stopped`，不支持重新启动；线程数 <= 0 或 queueSize == 0 时构造抛出 std::invalid_argument，不会得到可查询的线程池对象。
@@ -120,7 +150,7 @@ ThreadPool smallPool(1, 2); // 1 个 worker，最多 2 个任务等待
 
 第一个 Shutdown 调用者在 `mtx` 内将 Running 改为 ShuttingDown，解锁后 `condition.notify_all()` 并负责 join。后来者通过 `shutdownCondition.wait(lock, predicate)` 等待 Stopped，等待期间释放锁，醒来直接返回，不重复 join。负责人 join 完毕后重新加锁写入 Stopped，再解锁并 `shutdownCondition.notify_all()`。两个条件变量分别服务于 worker 等任务和外部调用者等关闭完成。
 
-`~ThreadPool(){ Shutdown(); }` 复用同一路径。重复 Shutdown 是幂等的，且每个外部调用正常返回时，已接受任务都已处理完。各状态访问由同一把 mtx 保护，join 时不持有这把锁。
+`~ThreadPool(){ Shutdown(); }` 复用同一路径。重复 Shutdown 是幂等的，且每个外部调用正常返回时，worker 已处理完全部入队任务；其他提交线程的 CallerRuns 调用由调用方另行等待。各状态访问由同一把 mtx 保护，join 时不持有这把锁。
 
 worker 用 `thread_local` 指针标记自己所属的线程池；Shutdown 在状态等待之前检查该标记，本池 worker 调用会抛出 `std::runtime_error("worker thread cannot call Shutdown")`，可在任务内捕获或由 future.get() 接收。这样不需要读取正在被另一个线程 join 的 std::thread 对象，也避免 worker 在关闭中等待自身退出。任务仍不得销毁自身线程池；并发 Shutdown 不意味着可以并发析构，对象必须活到所有外部调用结束。
 
@@ -179,7 +209,7 @@ auto text = pool.Submit([](std::string a, std::string b) {
 ## 状态查询与异常隔离
 
 - `GetTaskCount() const`：只统计仍在队列中等待的任务，使用 `mutable std::mutex` 支持 const 查询时加锁。
-- `GetActiveCount() const`：读取原子活动计数，包含所有 Submit 任务执行；worker 创建局部 guard 时 `++`，正常完成或 catch 处理后离开作用域，由 guard 析构执行 `--`。
+- `GetActiveCount() const`：读取原子活动计数，只包含 worker 执行，不包含 CallerRuns；worker 创建局部 guard 时 `++`，正常完成或 catch 处理后离开作用域，由 guard 析构执行 `--`。
 - `GetWorkerCount() const`：返回 `workers.size()`；固定线程数设计下，构造完成后容器不再增删，存活对象的正常查询无需额外加锁。它不是空闲线程数，也不是活动任务数。
 - `IsRunning() const`：与 Submit 和 Shutdown 使用同一把 `mtx`，在锁内判断 `state == State::Running`；true 表示仍接受任务，不代表当前有任务执行。关闭中、关闭完成时均为 false；无效构造参数会直接抛异常。可在显式 Shutdown 后查询仍存活的对象，不能在析构开始后查询。
 - 四个查询都支持 const 对象，是瞬时观察，不构成联合快照。worker 出队、解锁后才增加活动数，因此两个数不能作为“全部任务已经完成”的判断；应使用 future、Shutdown 或析构等待。future 就绪也可能早于 worker 的减计数，测试会另外等待活动数归零。
@@ -219,7 +249,7 @@ c++ -std=c++17 -Wall -Wextra -pedantic -pthread main.cpp ThreadPool.cpp -o main
 
 Windows 可将两个 cpp 和头文件加入同一个 Visual Studio C++ 控制台项目，使用 C++17。main.cpp 是唯一入口，不要只编译它。
 
-成功时最后输出“测试结束：37/37 通过”，退出码为 0；worker 的创建日志允许交错。
+成功时最后输出“测试结束：45/45 通过”，退出码为 0；worker 的创建日志允许交错。
 
 ## 后续阶段的正确性要求
 

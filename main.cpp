@@ -491,7 +491,9 @@ bool TestStoppedStatus() {
 // Shutdown 回归：去掉拒绝、排空、等待或 worker 自调用检查均应失败。
 bool RejectsSubmission(ThreadPool& pool) {
     try { pool.Submit([] { return 42; }); }
-    catch (const std::runtime_error&) { return true; }
+    catch (const std::runtime_error& error) {
+        return std::string(error.what()) == "ThreadPool has stopped";
+    }
     return false;
 }
 
@@ -652,6 +654,154 @@ bool TestQueueCapacity(std::size_t capacity) {
         : "容量 2：正常提交、满队列重复拒绝、执行结果及释放后恢复");
 }
 
+// promise 固定 worker 和队列状态；断言失败或抛异常时也先放行 worker。
+struct PolicyTestGate {
+    std::promise<void> release;
+    std::shared_future<void> future = release.get_future().share();
+    bool opened = false;
+    void open() { if (!opened) { release.set_value(); opened = true; } }
+};
+struct PolicyReleaseGuard {
+    PolicyTestGate& gate;
+    ~PolicyReleaseGuard() { gate.open(); }
+};
+
+template<typename T>
+bool HasRuntimeError(std::future<T>& result, const char* message) {
+    if (!result.valid() || result.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+        return false;
+    try { result.get(); }
+    catch (const std::runtime_error& error) { return std::string(error.what()) == message; }
+    catch (...) {}
+    return false;
+}
+
+bool TestFullPolicy(RejectPolicy policy) {
+    PolicyTestGate gate;
+    std::promise<void> entered;
+    auto started = entered.get_future();
+    std::atomic<int> queuedCalls{0}, overflowCalls{0};
+    const auto submitter = std::this_thread::get_id();
+    ThreadPool pool(1, 1, policy);
+    PolicyReleaseGuard guard{gate};
+    auto active = pool.Submit([&] { entered.set_value(); gate.future.wait(); return 10; });
+    if (started.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+        return Report(false, "策略测试 worker 启动超时");
+    auto queued = pool.Submit([&] { ++queuedCalls; return std::this_thread::get_id(); });
+    bool passed = pool.GetTaskCount() == 1 && pool.GetActiveCount() == 1;
+    for (int i = 0; i < 3; ++i) {
+        bool threw = false;
+        try {
+            auto result = pool.Submit([&] {
+                ++overflowCalls;
+                // 查询需要同一把锁，验证 CallerRuns 确实在锁外执行。
+                return std::this_thread::get_id() == submitter &&
+                    pool.GetTaskCount() == 1 && pool.GetActiveCount() == 1 && pool.IsRunning();
+            });
+            if (policy == RejectPolicy::CallerRuns) {
+                passed = result.wait_for(std::chrono::seconds(0)) == std::future_status::ready && passed;
+                passed = result.get() && passed;
+            } else if (policy == RejectPolicy::Discard) {
+                passed = result.wait_for(std::chrono::seconds(0)) == std::future_status::ready && passed;
+                passed = HasRuntimeError(result, "ThreadPool task was discarded") && passed;
+            } else passed = false;
+        } catch (const std::runtime_error& error) {
+            threw = true;
+            passed = policy == RejectPolicy::Abort &&
+                std::string(error.what()) == "ThreadPool task queue is full" && passed;
+        } catch (...) { passed = false; }
+        passed = (threw == (policy == RejectPolicy::Abort)) &&
+            pool.GetTaskCount() == 1 && queuedCalls == 0 && passed;
+    }
+    // 即使队列满，关闭状态也优先于三种策略；对象始终存活。
+    auto closing = std::async(std::launch::async, [&] { pool.Shutdown(); });
+    passed = WaitForClosing(pool) && passed;
+    passed = RejectsSubmission(pool) && passed;
+    gate.open();
+    closing.get();
+    passed = active.get() == 10 && queued.get() != submitter && passed;
+    passed = RejectsSubmission(pool) && passed;
+    passed = queuedCalls == 1 && overflowCalls == (policy == RejectPolicy::CallerRuns ? 3 : 0)
+        && pool.GetTaskCount() == 0 && pool.GetActiveCount() == 0
+        && pool.GetWorkerCount() == 1 && !pool.IsRunning() && passed;
+    return Report(passed, policy == RejectPolicy::Abort ? "Abort：满队列立即抛异常，不执行，关闭状态优先"
+        : policy == RejectPolicy::CallerRuns ? "CallerRuns：调用线程锁外执行且 future 就绪，不重复入队，关闭状态优先"
+        : "Discard：满队列 future 保存指定异常，不执行，关闭状态优先");
+}
+
+bool TestDiscardVoidPolicy() {
+    PolicyTestGate gate;
+    std::promise<void> entered;
+    auto started = entered.get_future();
+    std::atomic<int> calls{0};
+    ThreadPool pool(1, 1, RejectPolicy::Discard);
+    PolicyReleaseGuard guard{gate};
+    auto active = pool.Submit([&] { entered.set_value(); gate.future.wait(); });
+    if (started.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+        return Report(false, "Discard void worker 启动超时");
+    auto queued = pool.Submit([] {});
+    auto discarded = pool.Submit([&] { ++calls; });
+    static_assert(std::is_same_v<decltype(discarded), std::future<void>>);
+    bool passed = discarded.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+    passed = HasRuntimeError(discarded, "ThreadPool task was discarded") && passed;
+    passed = pool.GetTaskCount() == 1 && calls == 0 && passed;
+    gate.open();
+    active.get();
+    queued.get();
+    pool.Shutdown();
+    return Report(passed && calls == 0, "Discard：future<void>.get 抛指定异常，任务始终不执行");
+}
+
+bool TestCallerRunsException() {
+    PolicyTestGate gate;
+    std::promise<void> entered;
+    auto started = entered.get_future();
+    int calls = 0;
+    ThreadPool pool(1, 1, RejectPolicy::CallerRuns);
+    PolicyReleaseGuard guard{gate};
+    auto active = pool.Submit([&] { entered.set_value(); gate.future.wait(); });
+    if (started.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+        return Report(false, "CallerRuns 异常测试 worker 启动超时");
+    auto queued = pool.Submit([] { return 7; });
+    auto failed = pool.Submit([&]() -> void { ++calls; throw std::runtime_error("caller failure"); });
+    bool passed = HasRuntimeError(failed, "caller failure") && pool.GetTaskCount() == 1;
+    auto next = pool.Submit([&](int n) { ++calls; return n * 2; }, 21);
+    passed = next.get() == 42 && calls == 2 && passed;
+    gate.open();
+    active.get();
+    passed = queued.get() == 7 && passed;
+    pool.Shutdown();
+    return Report(passed && calls == 2 && pool.GetActiveCount() == 0,
+        "CallerRuns：任务异常由 future 传递，后续带参数任务正常，无重复执行");
+}
+
+bool TestPolicyNormalQueue(RejectPolicy policy) {
+    PolicyTestGate gate;
+    std::promise<void> entered;
+    auto started = entered.get_future();
+    std::atomic<int> calls{0};
+    const auto submitter = std::this_thread::get_id();
+    ThreadPool pool(1, 2, policy);
+    PolicyReleaseGuard guard{gate};
+    auto active = pool.Submit([&] { entered.set_value(); gate.future.wait(); });
+    if (started.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+        return Report(false, "正常入队策略测试 worker 启动超时");
+    auto queued = pool.Submit([&](int n) { ++calls; return std::make_pair(n, std::this_thread::get_id()); }, 42);
+    bool passed = pool.GetTaskCount() == 1 && calls == 0 &&
+        queued.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+    gate.open();
+    active.get();
+    auto result = queued.get();
+    passed = result.first == 42 && result.second != submitter && passed;
+    auto recovered = pool.Submit([&] { ++calls; });
+    recovered.get();
+    pool.Shutdown();
+    return Report(passed && calls == 2 && pool.GetTaskCount() == 0 && pool.GetActiveCount() == 0,
+        policy == RejectPolicy::Abort ? "Abort：未满正常入队，由 worker 执行，释放容量后可继续提交"
+        : policy == RejectPolicy::CallerRuns ? "CallerRuns：未满正常入队，由 worker 执行，释放容量后可继续提交"
+        : "Discard：未满正常入队，由 worker 执行，释放容量后可继续提交");
+}
+
 int main() {
     int total = 0;
     int failures = 0;
@@ -705,6 +855,13 @@ int main() {
     check(TestWorkerShutdown(false));
     check(TestWorkerShutdown(true));
     check(TestSimultaneousShutdown());
+
+    for (auto policy : {RejectPolicy::Abort, RejectPolicy::CallerRuns, RejectPolicy::Discard}) {
+        check(TestFullPolicy(policy));
+        check(TestPolicyNormalQueue(policy));
+    }
+    check(TestDiscardVoidPolicy());
+    check(TestCallerRunsException());
 
     std::cout << "测试结束：" << (total - failures) << "/" << total << " 通过\n";
     return failures == 0 ? 0 : 1;
