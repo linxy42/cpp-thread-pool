@@ -21,28 +21,22 @@ bool TestEmptyPool() {
     return true;
 }
 
-bool TestInvalidCount(int threadCount) {
-    bool executed = false;
-    bool rejected = true;
-    {
-        ThreadPool pool(threadCount);
-        // 连续提交两次，也检查失败返回后锁是否自动释放。
-        for (int i = 0; i < 2; ++i) {
-            try {
-                pool.Submit([&executed]() { executed = true; });
-                rejected = false;
-            } catch (const std::runtime_error& error) {
-                rejected = rejected && std::string(error.what()) == "ThreadPool has stopped";
-            } catch (...) {
-                rejected = false;
-            }
-            rejected = (pool.GetTaskCount() == 0) && rejected;
-        }
-    }
-    bool passed = rejected && !executed;
+bool TestInvalidArguments(int count, std::size_t capacity, const char* message) {
+    bool passed = false;
+    try {
+        ThreadPool pool(count, capacity);
+    } catch (const std::invalid_argument& error) {
+        passed = std::string(error.what()) == message;
+    } catch (...) {}
     std::cout << (passed ? "[PASS] " : "[FAIL] ")
-              << "线程数 " << threadCount << " 拒绝提交\n";
+              << "构造参数 (" << count << ", " << capacity
+              << ") 异常类型及消息校验\n";
     return passed;
+}
+
+bool TestInvalidCount(int count) {
+    return TestInvalidArguments(count, 100,
+        "threadpoolCount must be greater than 0");
 }
 
 bool TestTaskCompletion(int threadCount) {
@@ -137,9 +131,10 @@ bool TestTemplateMixedSubmissions() {
 bool TestStoppedTemplateSubmission() {
     bool passed = true;
     bool executed = false;
-    for (int count : {0, -3}) {
-        // 用无效线程数构造仍存活的停止池，覆盖构造边界。
+    for (int count : {1, 3}) {
+        // 用显式关闭构造仍存活的停止池。
         ThreadPool pool(count);
+        pool.Shutdown();
         for (int i = 0; i < 2; ++i) {
             try {
                 pool.Submit([&executed] { executed = true; return 1; });
@@ -265,8 +260,9 @@ bool TestParameterizedMixed() {
 bool TestStoppedParameterized() {
     bool passed = true;
     bool executed = false;
-    for (int count : {0, -3}) {
+    for (int count : {1, 3}) {
         ThreadPool pool(count);
+        pool.Shutdown();
         for (int i = 0; i < 2; ++i) {
             try {
                 pool.Submit([&executed](int n) { executed = true; return n; }, i);
@@ -332,8 +328,9 @@ bool TestTaskCount() {
 
 bool TestStoppedTaskCount() {
     bool passed = true;
-    for (int count : {0, -3}) {
+    for (int count : {1, 3}) {
         ThreadPool pool(count);
+        pool.Shutdown();
         passed = (pool.GetTaskCount() == 0 && pool.GetActiveCount() == 0) && passed;
         try {
             pool.Submit([] {});
@@ -469,12 +466,13 @@ bool TestRunningStatus() {
 
 bool TestStoppedStatus() {
     bool passed = true;
-    for (int count : {0, -3}) {
-        // 对象仍存活；没有公开 Stop，不与析构并发调用成员函数。
+    for (int count : {1, 3}) {
+        // 关闭后对象仍存活，可以安全查询状态。
         ThreadPool pool(count);
+        pool.Shutdown();
         const ThreadPool& view = pool;
         for (int attempt = 0; attempt < 2; ++attempt) {
-            passed = (!view.IsRunning() && view.GetWorkerCount() == 0 &&
+            passed = (!view.IsRunning() && view.GetWorkerCount() == static_cast<std::size_t>(count) &&
                       view.GetTaskCount() == 0 && view.GetActiveCount() == 0) && passed;
             try {
                 auto result = pool.Submit([] { return 42; });
@@ -483,10 +481,10 @@ bool TestStoppedStatus() {
                 passed = (std::string(error.what()) == "ThreadPool has stopped") && passed;
             } catch (...) { passed = false; }
         }
-        passed = (!view.IsRunning() && view.GetWorkerCount() == 0 &&
+        passed = (!view.IsRunning() && view.GetWorkerCount() == static_cast<std::size_t>(count) &&
                   view.GetTaskCount() == 0 && view.GetActiveCount() == 0) && passed;
     }
-    return Report(passed, "0/-3 停止池：重复拒绝提交前后 running 为 false，四项状态一致");
+    return Report(passed, "1/3 worker 显式关闭后：重复拒绝提交前后 running 为 false，四项状态一致");
 }
 
 
@@ -603,6 +601,57 @@ bool TestSimultaneousShutdown() {
     return Report(passed, "50 轮四个外部线程同时 Shutdown，无重复 join 或死锁");
 }
 
+
+// 先等待 worker 进入任务，再填充队列；不依赖 sleep 或调度速度。
+bool TestQueueCapacity(std::size_t capacity) {
+    std::promise<void> entered, release;
+    auto started = entered.get_future();
+    auto gate = release.get_future().share();
+    std::atomic<int> executed{0}, rejectedExecuted{0};
+    ThreadPool pool(1, capacity);
+    // 位于 pool 之后，异常展开时先放行 worker，再析构线程池。
+    struct ReleaseGuard {
+        std::promise<void>& release;
+        bool done = false;
+        void open() { if (!done) { release.set_value(); done = true; } }
+        ~ReleaseGuard() { open(); }
+    } guard{release};
+    auto active = pool.Submit([&] {
+        entered.set_value();
+        gate.wait();
+        ++executed;
+        return 42;
+    });
+    bool passed = started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    if (!passed) return Report(false, "worker 启动超时");
+    passed = pool.GetTaskCount() == 0 && pool.GetActiveCount() == 1;
+    std::vector<std::future<int>> queued;
+    for (std::size_t i = 0; i < capacity; ++i) {
+        queued.push_back(pool.Submit([&, i] { ++executed; return static_cast<int>(i); }));
+        passed = queued.back().valid() && pool.GetTaskCount() == i + 1 && passed;
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        bool rejected = false;
+        try { pool.Submit([&] { ++rejectedExecuted; }); }
+        catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()) == "ThreadPool task queue is full";
+        } catch (...) {}
+        passed = rejected && pool.GetTaskCount() == capacity && passed;
+    }
+    guard.open();
+    passed = active.get() == 42 && passed;
+    for (std::size_t i = 0; i < capacity; ++i)
+        passed = queued[i].get() == static_cast<int>(i) && passed;
+    auto recovered = pool.Submit([&] { ++executed; return 99; });
+    passed = recovered.get() == 99 && passed;
+    pool.Shutdown();
+    passed = executed == static_cast<int>(capacity + 2) && rejectedExecuted == 0
+        && pool.GetTaskCount() == 0 && passed;
+    return Report(passed, capacity == 1
+        ? "容量 1：正常提交、满队列重复拒绝、执行结果及释放后恢复"
+        : "容量 2：正常提交、满队列重复拒绝、执行结果及释放后恢复");
+}
+
 int main() {
     int total = 0;
     int failures = 0;
@@ -615,6 +664,12 @@ int main() {
     check(TestEmptyPool());
     check(TestInvalidCount(0));
     check(TestInvalidCount(-3));
+    check(TestInvalidCount(-1));
+    check(TestInvalidArguments(1, 0, "queueSize must be greater than 0"));
+    check(TestInvalidArguments(4, 0, "queueSize must be greater than 0"));
+    check(TestInvalidArguments(0, 0, "threadpoolCount must be greater than 0"));
+    check(TestQueueCapacity(1));
+    check(TestQueueCapacity(2));
     check(TestTaskCompletion(1));
     check(TestTaskCompletion(3));
 

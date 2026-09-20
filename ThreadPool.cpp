@@ -17,11 +17,13 @@ bool NumberJudgment(int threadpoolCount){
     return true;
 }
 
-ThreadPool::ThreadPool(int threadpoolCount){
+ThreadPool::ThreadPool(int threadpoolCount,std::size_t queueSize):maxQueueSize(queueSize){
    if(!NumberJudgment(threadpoolCount)){
-    state=State::Stopped;
-    return;
+   throw std::invalid_argument("threadpoolCount must be greater than 0");
    }
+   if (queueSize == 0){
+    throw std::invalid_argument("queueSize must be greater than 0");
+}
 for(int i=0;i<threadpoolCount;++i){
     workers.emplace_back([i,this](){
         currentWorkerPool = this;
@@ -78,7 +80,6 @@ bool ThreadPool::IsRunning() const{
 }
 
 void ThreadPool::Shutdown(){
-    // 先拒绝本池 worker，避免在 ShuttingDown 时等待自身退出。
     if(currentWorkerPool == this){
         throw std::runtime_error("worker thread cannot call Shutdown");
     }

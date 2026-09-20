@@ -22,7 +22,7 @@ enum class State
 
 class ThreadPool{
 public:
-ThreadPool(int threadpoolCount);
+ThreadPool(int threadpoolCount,std::size_t queueSize=100);
 
 
 
@@ -56,6 +56,9 @@ Submit(F&& task, Arges&&... arges)
             throw std::runtime_error("ThreadPool has stopped");
         }
         else{
+            if(tasks.size()>=maxQueueSize){
+                throw std::runtime_error("ThreadPool task queue is full");
+            }
         tasks.push(wrapperTask);
         }
     }
@@ -84,6 +87,7 @@ std::queue <std::function<void()>> tasks;
 State state=State::Running;
 std::atomic<std::size_t> activeCount{0};
 std::condition_variable shutdownCondition;
+std::size_t maxQueueSize;
 };
 
 
