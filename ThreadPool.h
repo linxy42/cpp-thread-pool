@@ -13,12 +13,6 @@
 #include <cstddef>
 #include <atomic>
 
-enum class State
-{
-    Running,
-    ShuttingDown,
-    Stopped
-};
 
 enum class RejectPolicy
 {
@@ -27,30 +21,40 @@ enum class RejectPolicy
     Discard
 };
 
+class ActiveTaskGuard{
+ public:
+ActiveTaskGuard(std::atomic<std::size_t> &count);
+
+~ActiveTaskGuard();
+
+private:
+std::atomic<std::size_t> &activeCount;
+};
+
 class ThreadPool{
 public:
-ThreadPool(int threadpoolCount,std::size_t queueSize=100,RejectPolicy policy = RejectPolicy::Abort);
+ThreadPool(int threadCount,std::size_t queueSize=100,RejectPolicy policy = RejectPolicy::Abort);
 
-template<typename F, typename... Arges>
-std::future<std::invoke_result_t<F, Arges...>>
-Submit(F&& task, Arges&&... arges)
+template<typename F, typename... Args>
+std::future<std::invoke_result_t<F, Args...>>
+Submit(F&& task, Args&&... args)
 {
-    using ReturnType = std::invoke_result_t<F, Arges...>;
+    using ReturnType = std::invoke_result_t<F, Args...>;
 
     auto boundTask = std::bind(
         std::forward<F>(task),
-        std::forward<Arges>(arges)...
+        std::forward<Args>(args)...
     );
 
-    std::packaged_task<ReturnType()> Task(std::move(boundTask));
-    std::future<ReturnType> result = Task.get_future();
+    std::packaged_task<ReturnType()> packagedTask(std::move(boundTask));
+    std::future<ReturnType> result = packagedTask.get_future();
 
-    auto taskptr =
-        std::make_shared<std::packaged_task<ReturnType()>>(std::move(Task));
+    auto taskPtr =
+        std::make_shared<std::packaged_task<ReturnType()>>(std::move(packagedTask));
 
-    auto wrapperTask = [taskptr]()
+    auto wrapperTask = [taskPtr]()
     {
-        (*taskptr)();
+        (*taskPtr)();
     };
         bool callerRuns=false;
         bool discard = false;
@@ -110,6 +114,12 @@ void Shutdown();
 ~ThreadPool();
 
 private:
+enum class State
+{
+    Running,
+    ShuttingDown,
+    Stopped
+};
 std::vector<std::thread> workers;
 mutable std::mutex mtx;
 std::condition_variable condition;
@@ -119,15 +129,4 @@ std::atomic<std::size_t> activeCount{0};
 std::condition_variable shutdownCondition;
 std::size_t maxQueueSize;
 RejectPolicy rejectPolicy;
-};
-
-
-class ActiveTaskGuard{
- public:
-ActiveTaskGuard(std::atomic<std::size_t> &Count);
-
-~ActiveTaskGuard();
-
-private:
-std::atomic<std::size_t> &activeCount;
 };

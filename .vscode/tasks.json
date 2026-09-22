@@ -109,6 +109,48 @@
                 "isDefault": false
             },
             "detail": "调试器生成的任务。"
+        },
+        {
+            "label": "build thread pool tests",
+            "type": "cppbuild",
+            "command": "/usr/bin/clang++",
+            "args": [
+                "-g",
+                "${workspaceFolder}/tests/ThreadPoolTests.cpp",
+                "${workspaceFolder}/ThreadPool.cpp",
+                "-std=c++17",
+                "-pthread",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pedantic",
+                "-o",
+                "${workspaceFolder}/tests/ThreadPoolTests"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": false
+            },
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$gcc"
+            ]
+        },
+        {
+            "label": "run thread pool tests",
+            "type": "process",
+            "command": "${workspaceFolder}/tests/ThreadPoolTests",
+            "dependsOn": "build thread pool tests",
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [],
+            "group": {
+                "kind": "test",
+                "isDefault": false
+            }
         }
     ]
 }

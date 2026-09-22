@@ -5,3 +5,4 @@
 *.exe
 *.dSYM/
 .DS_Store
+/tests/ThreadPoolTests

@@ -1,268 +1,255 @@
 # c++线程池
 
-独立 GitHub 仓库的教学项目：`linxy42/cpp-thread-pool`。项目中文名称为“c++线程池”。
+基于 **C++17 标准库**实现的固定大小线程池，独立仓库：[linxy42/cpp-thread-pool](https://github.com/linxy42/cpp-thread-pool)。通过复用 worker 线程执行任务，练习任务调度、线程同步、泛型编程和资源管理。
 
-## 当前进度
+**当前版本：1.0（发布标签 `v1.0.0`）。** 基础功能、独立测试和使用说明已整理完成。这是教学项目，当前能力与已知边界如下，不承诺生产环境下的完整容错或性能指标。
 
-当前已在 RAII 活动任务计数的基础上，完成统一提交接口：仅保留模板版 `Submit(F&& task, Arges&&... arges)`，支持 void、不同返回类型和带参数任务，统一返回对应 future；已补齐 `GetTaskCount()`、`GetActiveCount()`、`GetWorkerCount()`、`IsRunning()` 四个状态查询接口。此前已完成 `Running / ShuttingDown / Stopped` 三态生命周期及显式 `Shutdown()`，支持幂等和多个外部线程并发关闭，析构统一调用 `Shutdown()`。本阶段完成可配置拒绝策略 Abort / CallerRuns / Discard，保留有界队列和构造参数校验。当前项目使用 **C++17**。
+## 功能特性
 
-已实现能力：
+- 固定数量的 worker，使用 FIFO 等待队列；任务出队后在锁外执行。
+- 泛型 `Submit(F&& task, Args&&... args)`，支持普通函数、lambda、带参数任务，以及 `void`、`int`、`double`、`std::string` 等返回类型。
+- 通过 `std::future` 获取结果和任务异常；使用 `std::packaged_task` 包装任务，使用 `std::promise` 表示丢弃结果。
+- 四个状态查询接口：等待任务数、worker 活动任务数、固定 worker 数量及是否接受任务。
+- 有界等待队列，容量默认 100；支持 `Abort`、`CallerRuns`、`Discard` 三种拒绝策略。
+- `Running → ShuttingDown → Stopped` 三态关闭，支持显式、重复及多个外部线程并发 `Shutdown()`。
+- RAII 管理锁、活动任务计数和线程池生命周期；析构时排空已入队任务并回收 worker。
+- 构造参数校验、任务异常隔离，以及按功能分区的 **45 项独立检查**；不依赖第三方测试框架。
 
-- 固定数量的 worker 线程池，使用 `std::queue<std::function<void()>>` 保存任务。
-- 有界等待队列：构造参数 `queueSize` 默认为 100，由 `maxQueueSize` 保存；队列满时按 Abort / CallerRuns / Discard 处理新任务，非法线程数或零队列容量在创建 worker 前抛异常。
-- 使用 `std::mutex` 保护任务队列和运行状态，配合 `std::condition_variable` 等待与唤醒；worker 取出任务后释放锁，再执行任务。
-- 显式 `Shutdown()` 或析构触发优雅关闭：停止接收任务，唤醒所有 worker，执行完已接收的任务，再逐一 `join()`；关闭完成后重复调用直接返回。
-- `Submit` 使用可变参数模板、`std::bind` 和 `std::forward` 接收任务及参数，自动推导返回类型，返回对应的 `std::future`；线程池不运行时抛出 `std::runtime_error`。旧 bool 提交接口已移除；int 专用接口此前已移除。void 任务同样返回 `std::future<void>`，用 `get()` 等待完成并接收异常。
-- `GetTaskCount()` 读取等待队列中的任务数（queued task count），在锁内调用 `tasks.size()`，不包含已取出的任务。
-- `GetActiveCount()` 读取 worker 正在执行的任务数（active task count），不包含 CallerRuns；使用 `std::atomic<std::size_t> activeCount{0}` 和 `load()`，多个 worker 的递增、递减不会丢失更新。
-- `GetWorkerCount()` 返回固定 worker 数量；`IsRunning()` 在锁内读取是否仍接受任务，正常构造为 true，关闭中及关闭后为 false；无效构造参数直接抛异常。
-- 模板版 `Submit` 使用 `std::lock_guard`，在同一锁内检查 `state == State::Running`、队列容量并入队，离开作用域释放锁后再通知 worker。
-- worker 使用局部 `ActiveTaskGuard` 管理活动数：构造时递增，离开作用域时自动递减；任务异常由 packaged_task 保存，worker 保留 `try/catch` 外层保护，单个任务失败不影响后续任务执行。RAII 将计数收尾绑定到对象生命周期，避免维护任务处理逻辑时遗漏手动递减。
+## 项目结构
 
-项目结构：
-
-- `ThreadPool.h`：类声明、成员和模板版 `Submit` 的完整定义，使用 pragma once 防止重复包含；模板定义放在头文件中，供调用处实例化。
-- `ThreadPool.cpp`：构造函数、worker 循环、四个状态查询接口、Shutdown、析构函数及 `ActiveTaskGuard` 的实现。
-- `main.cpp`：45 个独立测试，每组输出 PASS/FAIL；失败返回非零退出码。
-- `.vscode/tasks.json`：默认任务同时编译 main.cpp 和 ThreadPool.cpp；run 依赖 build。
-- `.vscode/launch.json`：启动前执行完整构建，调试生成的 main。
-- `.gitignore`：忽略可执行文件、目标文件和 macOS 调试产物。
-
-验证（2026-09-13）：C++17 多文件编译通过，开启 Wall/Wextra/Werror/pedantic 无警告；5/5 测试通过。
-测试分别覆盖空池析构、0 和 -3 拒绝重复提交、1 和 3 个 worker 将 20 个任务各执行一次。每个池离开作用域后才核对结果，主线程不通过 sleep 猜测完成时间。此测试覆盖多 worker 下的正确性，不测吞吐量或证明并行加速。
-
-当前提供独立 `Shutdown()` 接口；调用方仍须在析构开始前停止并等待所有访问线程（包括 Submit、查询及 Shutdown 调用方），任务不得销毁自身线程池。所有提交任务的异常由 packaged_task 保存并经 `future.get()` 传递；空任务尚未在提交时主动拒绝，部分线程创建失败时的回收仍待完善。`Submit` 的任务异常由 packaged_task 保存，并在 `future.get()` 时重新抛出。
-int 专用接口阶段验证（2026-09-16）：C++17 严格编译无警告，11/11 测试通过。新增覆盖单个 int 返回值、100 个 int 任务、void/int 混合提交、执行中及排队 int 任务的析构排空、停止池重复提交异常，以及任务异常经 future 传递后 worker 继续执行。停止路径用 0 和 -3 个线程构造的存活对象验证，不在析构后调用成员函数。
-
-模板阶段验证（2026-09-16）：C++17 严格编译无警告，15/15 测试通过。在原有 11 项基础上，新增不同返回值与对应 future 类型检查、旧 bool 接口与模板接口混合提交及析构排空、停止池重复提交异常、任务异常经 future 传递后 worker 继续执行。
-
-带参数阶段验证（2026-09-16）：C++17 严格编译无警告，23/23 测试通过。新增普通函数 add、多参数 lambda、string 返回值和左值/右值参数、std::ref、左值 callable 与仅可移动对象、带参数任务与 Submit 混合执行及析构排空、停止状态重复提交异常、任务异常传递测试。停止状态仍用 0 和 -3 个线程构造的存活对象验证，不调用已析构对象。
-
-任务统计阶段验证（2026-09-17）：C++17 严格编译无警告，当前 23/23 测试通过。移除旧 int 专用接口的 6 项专用测试，新增 2 项队列统计测试和 4 项活动计数、异常隔离测试；其余 Submit/future 回归测试保留。通过 promise 控制任务开始和释放，验证 queued 为 6、单 worker 的 active 为 1、3 个 worker 并发时 active 为 3，以及任务结束后归零；普通 Submit 抛出 runtime_error 或未知异常后，后续 Submit 与带参数 future 任务仍能执行。
-
-RAII 阶段验证（2026-09-18）：C++17 多文件严格编译（Wall/Wextra/Werror/pedantic）无警告，23/23 测试通过。正常任务执行时 active 为 1，3 个 worker 同时执行时 active 为 3，完成后均归零；普通 Submit 抛出 std::runtime_error 或未知异常后计数仍归零，worker 继续执行后续普通和模板任务。GetTaskCount、带参数任务、future 返回值与异常传递等现有回归测试全部通过。复用现有 promise 同步测试，无需修改测试或修复 RAII 实现。
-
-统一接口验证（2026-09-18）：先运行原有 23/23 测试，并单独确认原模板对无参 void 任务返回 `std::future<void>`、`get()` 等待完成及传递异常；之后删除 bool 接口并完成模板重命名。迁移旧 bool 返回值断言和普通异常测试，新增 void lambda / `std::function<void()>` 的 future 类型及 get 测试，最终 C++17 严格编译无警告，24/24 测试通过。覆盖 int/double/string、带参数任务、左值/右值和 std::ref、仅可移动对象、停止池重复拒绝且不入队、析构排空及 RAII 并发计数。模板实现、参数绑定、锁内入队和 worker 逻辑无须修复。该次验证未 commit/push。
-
-统一接口与状态查询收尾验证（2026-09-18）：确认仅保留统一模板 `Submit`，旧 `SubmitInt`、`SubmitNew` 和 bool 提交接口均无代码残留，所有调用点已迁移。C++17 严格编译（Wall/Wextra/Werror/pedantic）无警告，26/26 测试通过。覆盖 void/int/double/string、带参数任务、future.get、停止池拒绝提交、队列计数、单 worker 与多 worker 活动数及归零、标准/未知异常后 worker 继续工作；新增检查 1/3 个 worker 的数量及构造后、任务内、任务完成后 IsRunning 为 true，0/-3 停止池重复拒绝提交前后 IsRunning 为 false 且三项计数均为 0。停止状态测试对象始终存活，析构排空另有回归测试，不在析构开始后查询状态。线程池实现无需修复，本次仅补齐测试与文档，并将本阶段改动一并提交。
-
-以上早期验证记录描述当时的接口行为；当前 API 以统一模板为准。停止状态提交统一抛出 `std::runtime_error("ThreadPool has stopped")`，不再返回 bool。早期测试用 0/-3 个线程构造的存活停止池验证拒绝行为；当前无效线程数在构造时抛异常，停止状态测试已统一改用显式 Shutdown 后仍存活的对象，不在析构开始后调用 Submit。
-
-当前已完成有界队列及三种可配置拒绝策略（Abort / CallerRuns / Discard），并补齐本阶段测试与文档；下一步可按学习进度准备基础版收尾。空任务主动拒绝和部分线程创建失败时的回收仍待完善，动态扩缩容属于后续进阶内容。
-
-先由学习者写代码，再一起检查、验证、提交；不提前填完后续答案。
-
-起点依据：你在另一个仓库 cpp-learing 中的 StudentManagement2.0 已使用类、构造函数、vector、引用和文件读写。
-项目最初以 thread 和 join 为起点，目前已推进到线程数量校验、提交状态检查、析构排空、模板任务返回值和带参数任务提交。
-
-## 第一版的边界
-
-最初第一版采用 C++11 标准库，固定数量的工作线程；当前版本使用 C++17。最终以 queue<std::function<void()>> 保存无参数、无返回值任务；
-先学习普通函数，再介绍 lambda 和 std::function，不要求自己编写模板。
-提交任务后唤醒工作线程；工作线程等待任务、取任务、释放锁、执行任务，再继续等待。
-停止时拒绝新任务，执行完已接收任务，唤醒并 join 所有工作线程。
-第一版不加入 future、packaged_task、可变参数模板、动态扩缩容或无锁队列；当前阶段已在第一版基础上加入 future、packaged_task 和模板版 Submit，并已扩展可变参数模板与完美转发，返回值不再限于 int。
-
-## 原定路线与验收
-
-实际学习已完成线程基础、任务队列与等待循环、固定 worker 和析构排空；已补线程数量和提交状态检查，阶段 5 的普通 Submit 任务异常隔离已完成，线程创建失败处理仍未完成；返回值扩展已完成模板版 Submit 和带参数任务提交，已加入任务统计与 RAII 活动计数保护，已完成统一 Submit 和四个状态查询接口，已补齐三态生命周期与并发 Shutdown，本阶段完成可配置拒绝策略及对应 future 语义验证。下表保留最初学习路线，实际进度以上述里程碑为准。
-
-| 阶段 | 你要动手完成的内容 | 要掌握的知识 | 验收后提交信息 |
-| --- | --- | --- | --- |
-| 0（已完成） | 阅读路线，开始下面的练习 | 线程池的目标和学习顺序 | docs(thread-pool): initialize learning roadmap |
-| 1 | 一个普通函数在子线程执行，主线程等待 | thread、函数作为入口、join、生命周期 | feat(thread-pool): complete thread and join exercise |
-| 2 | 单线程任务队列；再练习两个线程安全更新计数 | queue、std::function<void()>、lambda、mutex、lock_guard | feat(thread-pool): complete queue and mutex exercises |
-| 3 | 一个 worker 等待、取出并执行任务，可结束退出 | unique_lock、condition_variable、带条件的 wait、notify_one | feat(thread-pool): complete single worker loop |
-| 4 | 封装 ThreadPool，构造时启动固定数量 worker | `vector<thread>`、构造与析构、共享状态、禁止复制 | feat(thread-pool): complete fixed size thread pool |
-| 5（部分完成） | 已实现显式/析构优雅关闭与并发关闭验证，部分线程创建失败回收待完善 | 停止标志、notify_all、排空任务、join、资源释放 | feat(thread-pool): complete graceful shutdown |
-| 6（已完成） | 从 int 专用接口扩展为泛型提交接口，获取不同类型任务结果 | C++17、invoke_result_t、packaged_task、future、shared_ptr | feat: generalize task submission with template futures |
-| 7（已完成） | 带参数任务提交，支持不同返回类型和参数列表 | Args...、std::bind、std::forward、转发引用 | feat: support parameterized tasks with perfect forwarding |
-| 8（已完成） | 等待任务数、活动任务数与普通任务异常隔离 | mutable mutex、lock_guard、atomic、try/catch | feat: track queued and active tasks |
-| 9（已完成） | 使用 ActiveTaskGuard 自动管理活动任务计数 | RAII、引用成员、初始化列表、作用域与析构 | refactor: manage active task count with RAII |
-| 10（已完成） | 统一 Submit，完善队列数、活动数、worker 数及运行状态查询 | 统一模板 API、const 查询、互斥锁与原子计数、对象生命周期 | refactor: unify submit API and add thread pool status queries |
-| 11（已完成） | 三态生命周期、显式及并发 Shutdown、析构统一关闭 | State、条件变量谓词、关闭负责人、thread_local worker 身份 | feat: add thread pool shutdown state machine |
-| 12（已完成） | 有界任务队列、构造参数校验、满队列拒绝 | maxQueueSize、std::invalid_argument、锁内容量检查、同步边界测试 | feat: add bounded task queue and input validation |
-| 13（已完成） | 可配置 Abort / CallerRuns / Discard 拒绝策略 | 枚举策略、锁外执行、promise 异常与 future 语义 | feat: add configurable task rejection policies |
-
-每阶段流程：你写代码 → 解释关键语句 → 一起检查并运行验收 → 更新这里的真实进度 → commit 并同步 GitHub。
-未完成的练习不标记完成；阶段较大时可以保存明确注明 WIP 的进度，但不算验收完成。
-任务统计与异常隔离已完成第八阶段，RAII 计数保护已完成第九阶段，统一提交与状态查询已完成第十阶段；后续继续补齐空任务拒绝与部分线程创建失败的回收，第十一阶段已完成显式 Shutdown，第十二阶段已完成有界队列、参数校验和满队列拒绝，第十三阶段已完成三种可配置拒绝策略，动态扩缩容仍未实现。
-
-## 有界任务队列与构造参数校验
-
-构造接口为 `ThreadPool(int threadpoolCount, std::size_t queueSize = 100, RejectPolicy policy = RejectPolicy::Abort)`。`queueSize` 通过初始化列表保存到成员 `maxQueueSize`，只限制队列中等待的任务数，不包含 worker 已取出或正在执行的任务；容量固定，不随提交动态增长。
-
-- `threadpoolCount <= 0`：抛出 `std::invalid_argument("threadpoolCount must be greater than 0")`。
-- `queueSize == 0`：抛出 `std::invalid_argument("queueSize must be greater than 0")`。
-- 两项校验都在创建 worker 前完成；两者同时非法时，先报告线程数错误。
-- `Submit` 在 `mtx` 保护下先检查运行状态，再检查 `tasks.size() >= maxQueueSize`。默认 Abort 策略下，队列满时立即抛出 `std::runtime_error("ThreadPool task queue is full")`，被拒绝的任务不会入队或执行，调用方也不会取得该次提交的 future。
-- 满队列时按构造参数 policy 处理，不等待空位；worker 出队释放容量后可以继续提交。关闭中或关闭后仍优先抛出 `std::runtime_error("ThreadPool has stopped")`。
-
-```cpp
-ThreadPool defaultPool(3); // 3 个 worker，默认等待队列容量 100
-ThreadPool smallPool(1, 2); // 1 个 worker，最多 2 个任务等待
-// ThreadPool invalidThreads(0); // 抛出 std::invalid_argument
-// ThreadPool invalidQueue(3, 0); // 抛出 std::invalid_argument
+```text
+cpp-thread-pool/
+├── ThreadPool.h                 # 类声明、状态和泛型 Submit 定义
+├── ThreadPool.cpp               # worker、Shutdown、查询和 RAII 实现
+├── main.cpp                     # 简洁使用示例
+├── tests/
+│   └── ThreadPoolTests.cpp       # 独立测试入口
+├── .vscode/
+│   ├── tasks.json               # 示例与测试的构建、运行任务
+│   ├── launch.json              # 示例调试配置
+│   └── c_cpp_properties.json    # macOS / C++17 IntelliSense 配置
+├── .gitignore                   # 忽略可执行文件、目标文件和调试产物
+└── README.md
 ```
 
-本阶段验证（2026-09-20）：使用 clang++ / C++17 / pthread，开启 Wall/Wextra/Werror/pedantic 严格编译无警告，37/37 测试通过，连续运行 10 次及写回后重新编译运行均通过；提交前再次严格编译并运行，37/37 通过。
+`Submit` 是模板，完整定义放在头文件中，供调用处实例化。示例和测试各自有 `main()`，需要分别编译链接。
 
-- 仓库测试覆盖线程数 0、-1、-3，零队列容量及同时非法参数的异常类型和消息；停止状态回归改用显式 Shutdown 后仍存活的对象。
-- 容量 1、2 的测试通过 promise 同步阻塞 worker，再填满等待队列，验证正常提交、满队列重复拒绝、被拒绝任务不执行，以及释放容量后继续提交；不依赖 sleep 猜测满队列时机。
-- 本地附加边界测试覆盖 INT_MIN；线程创建接口监测确认非法构造期间调用次数为 0，正常创建 1 个 worker 的对照为 1。附加探针不计入仓库的 37 项测试。
+## 编译与运行
 
-## 可配置任务拒绝策略
+需要支持 C++17 的编译器和标准库。当前验证环境为 macOS Apple Silicon、Apple clang 21，使用 pthread；仓库没有引入 CMake 或第三方依赖。
 
-构造函数通过初始化列表将 `policy` 保存到 `rejectPolicy`，默认 `RejectPolicy::Abort`，原有一参、两参构造用法保持有效。三种策略只在 Running 且等待队列已满时生效；队列未满时均正常入队，由 worker 执行。
-
-| 策略 | 满队列行为 | future 语义 | 适用含义 |
-| --- | --- | --- | --- |
-| `Abort`（默认） | Submit 当场抛出 `std::runtime_error("ThreadPool task queue is full")`，任务不执行 | 本次调用不返回 future | 需要调用方立即处理过载、重试或报告失败 |
-| `CallerRuns` | 不入队，解锁后由调用 Submit 的线程同步执行 | Submit 等执行结束才返回已就绪的 future；结果或任务异常通过 get 获取 | 允许提交线程承担工作，以降低提交速度；会增加 Submit 的耗时 |
-| `Discard` | 不入队，也不执行任务 | 返回已就绪、带异常的 future；get 抛出 `std::runtime_error("ThreadPool task was discarded")`，包括 future<void> | 允许丢弃新任务；调用方仍可通过 future 观察丢弃结果 |
-
-```cpp
-ThreadPool abortPool(3, 100); // 默认 Abort
-ThreadPool callerPool(3, 100, RejectPolicy::CallerRuns);
-ThreadPool discardPool(3, 100, RejectPolicy::Discard);
-```
-
-Discard 使用 `std::promise<ReturnType>::set_exception` 创建拒绝结果，返回的是这个 promise 对应的 future，不是原 packaged_task 的 future。因此 get 接收的是上述明确的 runtime_error；即使任务返回 void，也应调用 get 观察异常。CallerRuns 的任务异常同样由 packaged_task 保存，不会作为任务异常直接从 Submit 抛出。
-
-CallerRuns / Discard 在各自处理后直接返回，只有正常入队路径调用 `condition.notify_one()`。`GetTaskCount()` 仅统计等待队列，`GetActiveCount()` 仅统计 worker 执行，不计 CallerRuns；CallerRuns 不创建额外 worker。Shutdown 仍负责排空等待队列并等待 worker，不等待其他提交线程中尚未结束的 CallerRuns 调用；调用方必须等待所有 Submit 调用结束后再析构线程池。关闭中或关闭后，三种策略都优先抛出 `std::runtime_error("ThreadPool has stopped")`。
-
-本阶段验证（2026-09-20）：C++17 严格编译（Wall/Wextra/Werror/pedantic/pthread）无警告，45/45 测试通过，连续运行 10 次均通过；写回仓库后再次严格编译运行通过。保留原有 37 项回归并新增 8 项：
-
-- 三种策略分别验证队列满时的处理、重复提交不产生多余执行，以及关闭中和关闭后优先拒绝。
-- 三种策略分别验证队列未满时确实入队、由 worker 执行，并在释放容量后正常继续提交。
-- 单独验证 Discard 的 future<void> 抛出指定异常且任务不执行。
-- 单独验证 CallerRuns 任务异常经 future 传递、后续带参数任务正常执行；满队列测试还核对调用线程身份、锁外查询状态及返回 future 已就绪。
-
-使用 promise 固定 worker 阻塞和队列占用，不靠 sleep 猜测队列是否已满。原有 Shutdown/state machine、四项状态查询、参数校验、泛型 Submit 与异常隔离测试均通过。本阶段无需修复线程池实现，仅补充测试和文档，并提交学习者已完成的拒绝策略代码。
-
-## 三态生命周期与显式关闭
-
-正常生命周期为 `State::Running → State::ShuttingDown → State::Stopped`，不支持重新启动；线程数 <= 0 或 queueSize == 0 时构造抛出 std::invalid_argument，不会得到可查询的线程池对象。
-
-- `Running`：Submit 在锁内检查状态并入队；worker 在队列为空时等待 `condition`。
-- `ShuttingDown`：拒绝新任务，但 worker 继续处理已接受任务，只有队列为空且不再 Running 时才退出。
-- `Stopped`：所有 worker 已 join，队列和活动数均为 0；GetWorkerCount 仍返回构造的固定线程数，不表示存活线程数。
-
-第一个 Shutdown 调用者在 `mtx` 内将 Running 改为 ShuttingDown，解锁后 `condition.notify_all()` 并负责 join。后来者通过 `shutdownCondition.wait(lock, predicate)` 等待 Stopped，等待期间释放锁，醒来直接返回，不重复 join。负责人 join 完毕后重新加锁写入 Stopped，再解锁并 `shutdownCondition.notify_all()`。两个条件变量分别服务于 worker 等任务和外部调用者等关闭完成。
-
-`~ThreadPool(){ Shutdown(); }` 复用同一路径。重复 Shutdown 是幂等的，且每个外部调用正常返回时，worker 已处理完全部入队任务；其他提交线程的 CallerRuns 调用由调用方另行等待。各状态访问由同一把 mtx 保护，join 时不持有这把锁。
-
-worker 用 `thread_local` 指针标记自己所属的线程池；Shutdown 在状态等待之前检查该标记，本池 worker 调用会抛出 `std::runtime_error("worker thread cannot call Shutdown")`，可在任务内捕获或由 future.get() 接收。这样不需要读取正在被另一个线程 join 的 std::thread 对象，也避免 worker 在关闭中等待自身退出。任务仍不得销毁自身线程池；并发 Shutdown 不意味着可以并发析构，对象必须活到所有外部调用结束。
-
-```cpp
-ThreadPool pool(3);
-auto result = pool.Submit([](int n) { return n * 2; }, 21);
-pool.Shutdown(); // 等任务完成并回收所有 worker
-int value = result.get(); // 42
-pool.Shutdown(); // 已关闭，直接返回
-// pool.Submit([] {}); // 抛出 runtime_error，线程池已停止
-```
-
-三态关闭验证（2026-09-19）：C++17 严格编译（Wall/Wextra/Werror/pedantic）无警告，31/31 测试通过。保留 26 项既有回归，新增显式/重复关闭、关闭中及关闭后拒绝提交、两个外部调用等待队列排空、Running 与 ShuttingDown 时 worker 自调用拒绝，以及 50 轮四线程同时关闭。析构排空、四项状态查询、future 和带参数任务均通过。阻塞任务使用 promise 放行，等待行为通过有限观察窗口检查；测试不访问已析构对象。修复前的可编译旧关闭逻辑在“后来者等待”测试中失败，修复后通过。
-
-附加 ThreadSanitizer 检查：原版在 macOS 标准库 `std::cout` 的并发创建日志路径报告两条竞争告警；在临时副本中仅去掉该日志后，31/31 测试通过且无检测器告警。正式代码保留日志，因此不宣称原版通过完整 TSan 检查。
-
-## 模板任务提交与返回值
-
-`Submit(F&& task, Arges&&... arges)` 接收任务和参数，返回 `std::future<std::invoke_result_t<F, Arges...>>`。`Arges...` 是代码中的类型参数包名称，通常也写作 `Args...`；空参数包仍支持原来的无参任务：
-
-1. `std::invoke_result_t<F, Arges...>` 推导任务的返回类型 `ReturnType`，因此当前编译标准需要 C++17。
-2. `std::bind(std::forward<F>(task), std::forward<Arges>(arges)...)` 将函数和参数绑定成无参任务；`F&&` 与 `Arges&&...` 为转发引用，`std::forward` 保留传入 bind 时的值类别。
-3. 将 boundTask 用 `std::move` 移入 `std::packaged_task<ReturnType()>`，避免拷贝仅可移动绑定对象；通过 `get_future()` 获取对应的 `std::future<ReturnType>`。
-4. packaged_task 不可拷贝，使用 `std::shared_ptr` 持有它，再由捕获该指针的可拷贝 lambda 包装成 `void()` 任务，放入现有队列。
-5. worker 执行包装任务，结果或异常写入共享状态；调用方通过 `future.get()` 等待并取得结果，或接收任务异常。
-
-```cpp
-ThreadPool pool(3);
-auto done = pool.Submit([] { /* 执行无返回值任务 */ });
-done.get(); // 等待完成；任务抛异常时在这里重新抛出
-auto integer = pool.Submit([] { return 42; });
-auto decimal = pool.Submit([] { return 3.25; });
-auto text = pool.Submit([] { return std::string("thread pool"); });
-
-int i = integer.get();
-double d = decimal.get();
-std::string s = text.get();
-```
-
-示例需包含 `ThreadPool.h` 和 `<string>`。带参数任务可以直接提交：
-
-```cpp
-int add(int a, int b) { return a + b; }
-
-// 在调用函数中：
-ThreadPool pool(3);
-auto sum = pool.Submit(add, 10, 20); // sum.get() == 30
-std::string prefix = "hello";
-auto text = pool.Submit([](std::string a, std::string b) {
-    return a + " " + b;
-}, prefix, std::string("pool")); // text.get() == "hello pool"
-```
-
-`std::bind` 默认按值保存衰减后的参数：左值拷贝、右值可移动；要修改原对象，请显式使用 `std::ref`，并保证原对象活到任务结束。完美转发发生在构造绑定对象时，bind 执行时通常把保存的普通参数作为左值传递，因此当前设计不支持所有仅接受右值引用的任务，也不能直接把绑定的 unique_ptr 按值移交给任务；可让任务接收其 const 引用，或使用捕获所有权的 lambda。队列与 worker 设计保持不变。
-
-## 状态查询与异常隔离
-
-- `GetTaskCount() const`：只统计仍在队列中等待的任务，使用 `mutable std::mutex` 支持 const 查询时加锁。
-- `GetActiveCount() const`：读取原子活动计数，只包含 worker 执行，不包含 CallerRuns；worker 创建局部 guard 时 `++`，正常完成或 catch 处理后离开作用域，由 guard 析构执行 `--`。
-- `GetWorkerCount() const`：返回 `workers.size()`；固定线程数设计下，构造完成后容器不再增删，存活对象的正常查询无需额外加锁。它不是空闲线程数，也不是活动任务数。
-- `IsRunning() const`：与 Submit 和 Shutdown 使用同一把 `mtx`，在锁内判断 `state == State::Running`；true 表示仍接受任务，不代表当前有任务执行。关闭中、关闭完成时均为 false；无效构造参数会直接抛异常。可在显式 Shutdown 后查询仍存活的对象，不能在析构开始后查询。
-- 四个查询都支持 const 对象，是瞬时观察，不构成联合快照。worker 出队、解锁后才增加活动数，因此两个数不能作为“全部任务已经完成”的判断；应使用 future、Shutdown 或析构等待。future 就绪也可能早于 worker 的减计数，测试会另外等待活动数归零。
-- 所有任务（包括 void）的标准异常和未知异常均通过 `future.get()` 传递；忽略 future 就不会观察到其中的任务异常。worker 原有 try/catch 保留为外层保护。
-- `ActiveTaskGuard` 持有 `std::atomic<std::size_t>&`，通过构造函数初始化列表绑定线程池的计数器；构造时 `activeCount++`，析构时 `activeCount--`。worker 在任务执行的小作用域内创建 `ActiveTaskGuard guard(this->activeCount)`，不再手动配对递增和递减。RAII 负责计数清理；任务异常保存在 future 中，worker 的 try/catch 保留为外层保护。
-
-## 基础复习：创建并等待一个线程
-
-在本目录新建 stage01_thread.cpp，自己完成以下要求：
-
-1. 定义普通函数 void printNumbers()，用 for 循环输出 1 到 5。
-2. 在 main 中创建一个 std::thread，让它执行 printNumbers。
-3. 主线程调用 join() 等待它完成。
-4. join() 返回后，主线程输出 done。
-
-只需要 iostream 和 thread 两个头文件。先不引入 lambda、共享计数器或线程池类。
-提示：传给线程的是函数本身；不要把“立即调用函数”误当成“提供线程入口”。
-
-验收：程序输出 1 到 5，最后输出 done，并正常退出。数值可以逐行输出。
-完成后用自己的话回答：
-- printNumbers 和 main 分别由哪个线程执行？
-- join 等待的是谁？为什么 done 一定在最后？
-- 如果线程对象销毁时仍可 join，会有什么问题？
-
-## 当前版本编译与运行
-
-VS Code 请直接打开 cpp-thread-pool 文件夹。Cmd+Shift+B 运行默认的 build thread pool；命令面板选择 Tasks: Run Task → run thread pool 会先构建再运行。F5 选择“运行线程池”会先构建再调试。不要选择“生成活动文件”任务来构建本多文件项目。
-
-当前 VS Code 配置针对 macOS，使用 /usr/bin/clang++、LLDB 和 Microsoft C/C++ 扩展；其他系统需按安装位置调整工具链。
-
-macOS / Linux 也可以在仓库根目录执行：
+在仓库根目录执行：
 
 ```sh
-c++ -std=c++17 -Wall -Wextra -pedantic -pthread main.cpp ThreadPool.cpp -o main
+# 编译并运行基础示例
+clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -pthread main.cpp ThreadPool.cpp -o main
 ./main
+
+# 编译并运行完整测试
+clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -pthread tests/ThreadPoolTests.cpp ThreadPool.cpp -o tests/ThreadPoolTests
+./tests/ThreadPoolTests
 ```
 
-Windows 可将两个 cpp 和头文件加入同一个 Visual Studio C++ 控制台项目，使用 C++17。main.cpp 是唯一入口，不要只编译它。
+示例输出 `10 + 20 = 30`。测试每项输出 PASS/FAIL，全部通过时最后输出 `测试结束：45/45 通过`，退出码为 0；检查失败返回 1。
 
-成功时最后输出“测试结束：45/45 通过”，退出码为 0；worker 的创建日志允许交错。
+Linux 可使用支持 C++17 的 clang++ 或将命令中的编译器替换为 g++；本次发布未在 Linux/Windows 实机验证。Windows 可在 Visual Studio 中建立两个 C++17 控制台目标，分别将示例或测试与 `ThreadPool.cpp` 链接。
 
-## 后续阶段的正确性要求
+### VS Code
 
-- 阶段 2：两个线程各递增 10000 次，join 后检查计数为 20000；每次共享读写都由同一把 mutex 保护。
-- 阶段 3：wait 使用条件判断，避免虚假唤醒导致从空队列取任务；等待时释放锁，取完任务后解锁再执行。
-- 阶段 4：用同步方式验证多个 worker 可以同时进入任务，不能只靠输出顺序或 sleep 判断并发；每个任务恰好执行一次。
-- 阶段 5：检查空池停止、带待处理任务停止、停止后提交被拒绝、重复停止和析构回收。
-- 队列和停止标志始终由同一把 mutex 保护；停止且队列为空时 worker 才退出。
-- 外部线程可显式调用 Shutdown；本池 worker 调用会抛异常，任务内不得销毁自身线程池。销毁对象前须等待所有外部调用结束。重复和并发关闭已纳入测试。
-- 空任务与零线程数要明确拒绝；任务抛异常需在 worker 内捕获并报告，避免异常逃出线程入口。
-- 创建部分线程后若后续创建失败，也要通知并回收已启动线程；这部分放到阶段 5 讲解。
+直接打开 `cpp-thread-pool` 文件夹。当前配置使用 `/usr/bin/clang++`、LLDB 和 Microsoft C/C++ 扩展；其他平台需调整工具链路径及 IntelliSense 配置。
 
-## 协作约定
+| 操作 / 任务 | 用途 |
+| --- | --- |
+| `Cmd+Shift+B` / `build thread pool` | 默认构建示例，生成 `main` |
+| Tasks: Run Task → `run thread pool` | 先构建，再运行示例 |
+| Tasks: Run Task → `build thread pool tests` | 严格编译测试，生成 `tests/ThreadPoolTests` |
+| Tasks: Run Task → `run thread pool tests` | 先构建，再运行完整测试 |
+| F5 → “运行线程池” | 先构建，再调试示例 |
 
-提交只包含本教学项目的相关文件，不混入可执行文件、构建目录和 IDE 临时文件。
-在阶段 1 完成前，不创建完整线程池答案。提交历史记录实际学习阶段，文档保留下一步和验收标准。
+不要用“生成活动文件”任务构建这个多文件项目，也不要把示例和测试的两个入口链接到同一个可执行文件。
+
+## 示例用法
+
+### 基础提交
+
+以下完整示例与 `main.cpp` 的用法一致：
+
+```cpp
+#include "ThreadPool.h"
+#include <iostream>
+
+int main() {
+    ThreadPool pool(4);
+    auto result = pool.Submit([](int a, int b) {
+        return a + b;
+    }, 10, 20);
+    std::cout << "10 + 20 = " << result.get() << '\n';
+    return 0; // 析构等待已入队任务完成，并 join 所有 worker。
+}
+```
+
+### 无返回值、引用参数与异常
+
+下面片段放在调用函数中；除 `ThreadPool.h` 外，显式包含 `<functional>`、`<iostream>` 和 `<stdexcept>`：
+
+```cpp
+int value = 10; // 先于 pool 构造，确保被引用对象的生命周期足够长。
+ThreadPool pool(2, 100, RejectPolicy::Abort);
+
+auto done = pool.Submit([](int& n) { ++n; }, std::ref(value));
+done.get(); // future<void>：等待完成，此时 value == 11。
+
+auto failed = pool.Submit([]() -> int {
+    throw std::runtime_error("task failed");
+});
+try {
+    failed.get();
+} catch (const std::runtime_error& error) {
+    std::cerr << error.what() << '\n';
+}
+
+auto next = pool.Submit([] { return 42; });
+pool.Shutdown(); // 排空队列并等待 worker 退出。
+std::cout << next.get() << '\n'; // 42，单个任务失败不会终止 worker。
+pool.Shutdown(); // 重复关闭直接返回。
+```
+
+## 核心设计
+
+### worker、任务队列与同步
+
+构造函数创建 `std::vector<std::thread>`，worker 数量在对象存活期间固定。等待队列为 `std::queue<std::function<void()>>`，不同返回类型的任务先包装为统一的 `void()` 调用入口。
+
+```text
+Submit → 包装任务 → 加锁检查状态与容量 → 入队 → 解锁 → notify_one
+                                                    ↓
+worker → 加锁等待 → 取队首任务 → 出队 → 解锁 → 执行 → 回到循环
+```
+
+`mtx` 同时保护等待队列和运行状态。worker 在“队列为空且仍为 Running”时循环调用 `condition.wait(lock)`：等待会释放锁，唤醒后重新加锁并检查条件，避免虚假唤醒导致访问空队列。任务执行期间不持有队列锁，因此其他线程可以继续提交、查询或开始关闭。
+
+FIFO 表示按入队顺序取出任务；多个 worker 的实际开始、完成顺序不保证与提交顺序一致。
+
+### RAII
+
+- `std::lock_guard` / `std::unique_lock` 管理加锁与解锁。
+- worker 在执行作用域内创建 `ActiveTaskGuard`，构造时增加原子活动数，离开作用域时自动减少。
+- `~ThreadPool()` 复用 `Shutdown()`，正常销毁时等待队列排空并回收线程。
+
+## 泛型 Submit 与 future
+
+公开提交接口：
+
+```cpp
+template<typename F, typename... Args>
+std::future<std::invoke_result_t<F, Args...>>
+Submit(F&& task, Args&&... args);
+```
+
+一次普通提交的执行过程：
+
+1. `std::invoke_result_t` 推导返回类型；`std::forward` 将任务和参数转发给 `std::bind`，形成无参调用对象。
+2. 将绑定对象移入 `std::packaged_task<ReturnType()>`，取得对应的 `std::future<ReturnType>`。
+3. 因为 packaged_task 不可拷贝，用 `std::shared_ptr` 持有，再用捕获该指针的可拷贝 lambda 适配 `std::function<void()>`。
+4. 在同一把锁内检查运行状态和容量。正常入队后解锁并唤醒一个 worker；满队列走配置的拒绝策略。
+5. worker 执行 packaged_task，将返回值或任务异常写入共享状态；调用方通过 `future.get()` 等待并取得结果，或接收异常。
+
+`future<void>` 同样需要 `get()` 以等待完成并观察异常。普通 future 的结果只能 `get()` 一次；忽略 future 会使其中保存的任务异常不被调用方观察到。
+
+`std::bind` 默认按值保存衰减后的参数：左值拷贝、右值可移动。要引用原对象需使用 `std::ref`，并保证对象在任务完成前有效。转发发生在构造绑定对象时，bind 执行时通常将保存的普通参数作为左值传递，因此 **不支持任意右值引用调用形式，也不能直接将绑定的 unique_ptr 按值移交给任务**。可使用接收 const 引用的任务，或捕获所有权的 lambda；现有测试覆盖这些仅可移动对象的用法。
+
+## 状态查询接口
+
+| 接口（均为 const） | 实际含义 | 同步方式 |
+| --- | --- | --- |
+| `GetTaskCount()` | 等待队列中的任务数，不包含已取出的任务 | 加锁读取 `tasks.size()` |
+| `GetActiveCount()` | worker 正在执行的任务数，不包含 CallerRuns | 原子计数 `load()` |
+| `GetWorkerCount()` | 构造时固定的 worker 数量，关闭后仍保持原值 | 读取构造后不再增删的 `workers.size()` |
+| `IsRunning()` | 是否处于 Running、仍接受任务 | 加锁读取状态 |
+
+它们是瞬时观察，不构成联合快照。`IsRunning()` 为 true 不保证下一次 Submit 一定成功，期间可能关闭或队列变满。worker 出队、解锁后才增加活动数，因此即使观察到 queued 和 active 都为 0，也不能据此判断所有任务完成。应使用 future 等待具体任务，或用 Shutdown 等待 worker 排空；future 就绪也可能早于活动数递减。
+
+## 有界队列与 RejectPolicy
+
+构造函数：
+
+```cpp
+ThreadPool(int threadCount, std::size_t queueSize = 100,
+           RejectPolicy policy = RejectPolicy::Abort);
+```
+
+`threadCount <= 0` 或 `queueSize == 0` 时，在创建任何 worker 前抛出 `std::invalid_argument`。线程数校验优先；为保持已有测试与行为兼容，消息分别为 `threadpoolCount must be greater than 0` 和 `queueSize must be greater than 0`。容量类型为无符号 `std::size_t`，调用方应提供正容量，不要传负数后依赖隐式转换进行校验。
+
+容量只限制**等待队列**，不包括 worker 正在执行的任务，也不限制 CallerRuns 并行调用数。构造后不提供修改容量或策略的接口。
+
+三种策略仅在 Running 且队列已满时生效；未满时均正常入队：
+
+| 策略 | 满队列行为 | 返回值 / 异常 |
+| --- | --- | --- |
+| `Abort`（默认） | 不入队、不执行，立即拒绝 | Submit 抛出 `std::runtime_error("ThreadPool task queue is full")`，不返回 future |
+| `CallerRuns` | 不入队，解锁后由提交线程同步执行 | Submit 等执行结束才返回已就绪的 future；结果及任务异常由 get 获取 |
+| `Discard` | 不入队、不执行，丢弃本次新任务 | 返回已就绪的 future，get 抛出 `std::runtime_error("ThreadPool task was discarded")`，也适用于 void |
+
+Discard 使用 `std::promise<ReturnType>::set_exception()` 构造明确的拒绝结果，返回这个 promise 对应的 future，而非原 packaged_task 的 future。CallerRuns 可以减慢提交线程，但会增加 Submit 的耗时；任务异常由 packaged_task 保存，不直接作为任务异常从 Submit 抛出。
+
+关闭中或关闭后，三种策略都优先拒绝提交并抛出 `std::runtime_error("ThreadPool has stopped")`，不会转为 CallerRuns。实现会先绑定任务、创建 packaged_task，再检查池状态，因此绑定或分配失败仍可能先抛异常。
+
+## 三态 Shutdown 状态机
+
+```text
+Running ──首个外部 Shutdown()──> ShuttingDown ──全部 worker join 完成──> Stopped
+   接受任务                         拒绝新任务、排空队列                       已关闭
+```
+
+| 状态 | Submit | worker 与 Shutdown |
+| --- | --- | --- |
+| `Running` | 根据容量入队或执行拒绝策略 | worker 等待或执行任务；首个关闭者切换状态 |
+| `ShuttingDown` | 抛出停止异常 | worker 继续排空；后续关闭者等待完成 |
+| `Stopped` | 抛出停止异常 | worker 均已 join；重复 Shutdown 直接返回 |
+
+第一个外部调用者在锁内改为 ShuttingDown，解锁后 `condition.notify_all()` 并负责 join，避免持有队列锁等待 worker。其他外部调用者通过 `shutdownCondition.wait(lock, predicate)` 等待 Stopped，等待期间释放锁；负责人 join 完毕后加锁写入 Stopped，再唤醒所有关闭等待者。两个条件变量分别负责“等待任务”和“等待关闭完成”。
+
+正常返回的 Shutdown 保证入队任务已完成、worker 已退出，等待队列和 worker 活动数为 0；不支持重新启动。**Shutdown 不等待其他提交线程上正在执行的 CallerRuns 任务**，这些 Submit 调用需要调用方另行等待。
+
+worker 使用 `thread_local` 指针标记所属线程池。本池 worker 调用 Shutdown 会在状态等待前抛出 `std::runtime_error("worker thread cannot call Shutdown")`，避免等待自身退出；异常可在任务内捕获或由 future.get 接收。
+
+## 线程安全、异常处理与 1.0 边界
+
+- 对象构造完成且保持存活时，支持多个外部线程提交、查询和显式关闭；队列及状态由同一 mutex 保护，活动数使用 atomic。任务访问的业务数据仍需调用方自行同步。
+- 析构开始前，必须停止并等待所有访问线程，包括 Submit（特别是 CallerRuns）、查询及 Shutdown 调用方。并发 Shutdown 不等于并发析构安全；任务不得销毁自身线程池。
+- 任务的标准异常和非标准异常由 packaged_task 保存并通过 future 传播，worker 保留外层 try/catch，活动计数由 RAII 收尾。
+- 当前未在提交时主动检查空 callable；不要提交空函数指针。空 `std::function` 的调用错误通常在 future.get 时观察到。不要将“任务异常隔离”理解为能捕获无效内存访问等未定义行为。
+- **部分 worker 创建成功、后续线程创建失败时的构造回滚尚未实现**；此类资源耗尽路径可能因销毁仍可 join 的线程而终止进程。任务出队复制等内部资源分配失败也没有完整恢复保证。1.0 不承诺基础设施故障下的强异常安全。
+- 不提供任务取消、关闭超时或强制终止。任务若一直阻塞，Shutdown/析构也会一直等待；worker 内等待同池尚未执行的任务可能耗尽 worker 并死锁。
+- ThreadPool 含 mutex 等不可复制成员，当前不支持复制或移动。没有动态扩缩容、优先级调度、work stealing、无锁队列或性能基准承诺。
+
+## 测试覆盖与发布验证
+
+`tests/ThreadPoolTests.cpp` 复用原有测试并按功能分区，当前共 45 项运行检查：
+
+| 分区 | 项数 | 覆盖内容 |
+| --- | --- | --- |
+| Constructor / 生命周期 | 9 | 空池析构、非法线程数、零容量及校验优先级、1/3 worker 各执行任务一次 |
+| Submit | 9 | void/int/double/string、普通函数、多参数 lambda、混合任务、std::ref、仅可移动对象、析构后取结果 |
+| Status | 6 | 等待数、单/多 worker 活动数及归零、固定 worker 数、运行/停止状态、const 查询 |
+| Shutdown | 7 | 停止后拒绝、显式/重复关闭、两个外部关闭者等待、worker 自调用拒绝、50 轮四线程同时关闭 |
+| Exception | 4 | 返回值/带参数/void 任务的标准及非标准异常、后续任务继续执行、活动数归零 |
+| BoundedQueue | 2 | 容量 1/2、满队列重复拒绝、释放容量后恢复 |
+| RejectPolicy | 8 | 三策略满/未满行为、关闭优先、CallerRuns 线程身份和锁外执行、Discard void、CallerRuns 异常 |
+
+测试使用 promise/future 控制 worker 的进入与放行，避免用 sleep 猜测队列已满；部分关闭等待检查使用有限观察窗口。它们验证功能与并发场景，不构成吞吐量测试或对所有线程交错的证明。
+
+1.0 发布验证（2026-09-22）：示例与测试均使用 C++17、`-Wall -Wextra -Werror -pedantic -pthread` 完整编译运行；示例输出 `10 + 20 = 30`，测试 **45/45 通过**，退出码均为 0。本次不宣称已完成 ThreadSanitizer、资源耗尽注入或跨平台验证。
+
+## 后续 2.0 规划
+
+以下均为展望，尚未实现；优先完善可靠性，再评估调度扩展：
+
+1. 补齐部分线程创建失败的回滚、空任务校验和内部异常路径测试。
+2. 增加任务等待/关闭超时及可协作的取消机制，明确排队任务与执行中任务的取消语义。
+3. 动态扩缩容，定义最小/最大 worker 数量和空闲回收规则。
+4. 优先级任务队列，并处理公平性与低优先级任务饥饿问题。
+5. 探索 work stealing，配套吞吐量、延迟和锁竞争基准后再评估收益。
+6. 增加 CMake、跨平台 CI 和并发检测，让构建与验证更容易复现。
+
+提交历史保留从线程基础、泛型任务、RAII、状态查询到关闭与拒绝策略的学习过程；本 README 统一描述当前 1.0 行为。

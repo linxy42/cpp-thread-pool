@@ -8,26 +8,17 @@ namespace {
 thread_local const ThreadPool* currentWorkerPool = nullptr;
 }
 
-bool NumberJudgment(int threadpoolCount){
 
-    if(threadpoolCount<=0){
-    std::cout<<"线程创建数量异常，请重试"<<std::endl;
-    return false;
-}
-    return true;
-}
-
-ThreadPool::ThreadPool(int threadpoolCount,std::size_t queueSize,RejectPolicy policy):maxQueueSize(queueSize),rejectPolicy(policy){
-   if(!NumberJudgment(threadpoolCount)){
+ThreadPool::ThreadPool(int threadCount,std::size_t queueSize,RejectPolicy policy):maxQueueSize(queueSize),rejectPolicy(policy){
+   if(threadCount<=0){
    throw std::invalid_argument("threadpoolCount must be greater than 0");
    }
    if (queueSize == 0){
     throw std::invalid_argument("queueSize must be greater than 0");
 }
-for(int i=0;i<threadpoolCount;++i){
-    workers.emplace_back([i,this](){
+for(int i=0;i<threadCount;++i){
+    workers.emplace_back([this](){
         currentWorkerPool = this;
-        std::cout<<"创造线程:"<<i<<std::endl;
         while(true){
             std::unique_lock<std::mutex> lock(this->mtx);
             while(this->tasks.empty()&&state==State::Running){
@@ -38,17 +29,17 @@ for(int i=0;i<threadpoolCount;++i){
             break;
             }
             else{
-            std::function<void()> temporary;
-            temporary= this->tasks.front();
+            std::function<void()> task;
+            task= this->tasks.front();
             this->tasks.pop();
             lock.unlock();
                 {
             ActiveTaskGuard guard(this->activeCount);
             try{
-            temporary();
+            task();
             }
-            catch(const std::exception& e){
-                std::cerr<< "任务执行异常: " << e.what();
+            catch(const std::exception& error){
+                std::cerr<< "任务执行异常: " << error.what()<<std::endl;
             }
             catch(...){
                 std::cerr<<"任务执行发生未知异常" << std::endl;
@@ -116,7 +107,7 @@ ThreadPool::~ThreadPool(){
 }
 
 
-ActiveTaskGuard::ActiveTaskGuard(std::atomic<std::size_t> &Count):activeCount(Count){
+ActiveTaskGuard::ActiveTaskGuard(std::atomic<std::size_t> &count):activeCount(count){
     activeCount++;
 }
 
